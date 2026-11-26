@@ -118,7 +118,7 @@ func parseMovie(dir, base string) ParsedFile {
 		out.Title = cleanTitle(cleaned)
 	}
 	if out.Year == nil {
-		parent := filepath.Base(dir)
+		parent := stripExternalIDTags(filepath.Base(dir))
 		if _, _, y, ok := findReleaseYear(parent); ok {
 			out.Year = &y
 		}
@@ -497,7 +497,7 @@ func inspectAnimeDirs(rootPath, itemDir string) (series string, year *int, seaso
 			}
 		}
 		if i == 0 || series == "" {
-			raw := p
+			raw := stripExternalIDTags(p)
 			if start, _, y, ok := findReleaseYear(raw); ok {
 				year = &y
 				raw = raw[:start]
@@ -519,7 +519,7 @@ func inferSeriesFromDirs(rootPath, fullPath string, out *ParsedFile) {
 	}
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	if len(parts) > 0 && parts[0] != "" {
-		series := parts[0]
+		series := stripExternalIDTags(parts[0])
 		if start, _, y, ok := findReleaseYear(series); ok {
 			out.Year = &y
 			series = series[:start]
@@ -577,9 +577,14 @@ func extractPathExternalIDs(rootPath, fullPath, base string) (tmdbID, imdbID str
 	return tmdbID, imdbID
 }
 
-func stripAnimeMeta(raw string) string {
+func stripExternalIDTags(raw string) string {
 	s := rePathTMDBID.ReplaceAllString(raw, " ")
 	s = rePathIMDBID.ReplaceAllString(s, " ")
+	return s
+}
+
+func stripAnimeMeta(raw string) string {
+	s := stripExternalIDTags(raw)
 	s = reCurlyTags.ReplaceAllString(s, " ")
 	s = reBrackets.ReplaceAllString(s, " ")
 	s = reParensMeta.ReplaceAllString(s, " ")

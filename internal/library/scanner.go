@@ -577,8 +577,8 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 		ProbedAt:              probedAt,
 	}
 
-	// 1. Offline local NFO sidecar enrichment (Kodi/Radarr/Sonarr XML, including parent tvshow.nfo).
-	if nfo, ok := metadata.ParseLocalNFO(job.path); ok {
+	// 1. Offline local NFO sidecar enrichment (Kodi/Radarr/Sonarr XML, including parent tvshow.nfo for episodes).
+	if nfo, ok := metadata.ParseLocalNFOForKind(lib.RootPath, job.path, item.Kind); ok {
 		if nfo.Title != "" {
 			item.Title = nfo.Title
 			item.SortTitle = makeSortTitle(nfo.Title)
@@ -631,8 +631,8 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 	}
 
 	// Preserve an existing TMDB ID (e.g. from a manual admin Identify/Re-Match) across re-scans
-	// unless overridden by a path ID tag or local .nfo sidecar.
-	if item.TMDBID == "" && job.existingTMDBID != "" {
+	// unless the path or local .nfo supplied an explicit external ID (TMDB or IMDb).
+	if item.TMDBID == "" && item.IMDBID == "" && job.existingTMDBID != "" {
 		item.TMDBID = job.existingTMDBID
 	}
 

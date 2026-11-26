@@ -69,18 +69,28 @@ type nfoXML struct {
 	} `xml:"uniqueid"`
 }
 
-// ParseLocalNFO checks for a sidecar .nfo file matching mediaPath (or movie.nfo / tvshow.nfo,
-// including a parent directory's tvshow.nfo for Season subfolders) and extracts standard
-// Kodi/Radarr/Sonarr XML metadata offline.
+// ParseLocalNFO checks for a sidecar .nfo file matching mediaPath (or movie.nfo / tvshow.nfo)
+// and extracts standard Kodi/Radarr/Sonarr XML metadata offline.
 func ParseLocalNFO(mediaPath string) (EnrichedInfo, bool) {
+	return ParseLocalNFOForKind("", mediaPath, "")
+}
+
+// ParseLocalNFOForKind extracts local Kodi/Radarr/Sonarr XML metadata for mediaPath,
+// restricting series-level tvshow.nfo inheritance to episodes (or unspecified kind)
+// and never traversing above rootPath when rootPath is non-empty.
+func ParseLocalNFOForKind(rootPath, mediaPath, kind string) (EnrichedInfo, bool) {
 	stem := strings.TrimSuffix(mediaPath, filepath.Ext(mediaPath))
 	dir := filepath.Dir(mediaPath)
 	parentDir := filepath.Dir(dir)
 
-	// 1. Prefer item-specific sidecar (<stem>.nfo or movie.nfo).
+	// 1. Prefer item-specific sidecar (<stem>.nfo, plus movie.nfo for movies/unspecified).
+	itemCandidates := []string{stem + ".nfo"}
+	if kind != "episode" {
+		itemCandidates = append(itemCandidates, filepath.Join(dir, "movie.nfo"))
+	}
 	var itemInfo EnrichedInfo
 	foundItem := false
-	for _, p := range []string{stem + ".nfo", filepath.Join(dir, "movie.nfo")} {
+	for _, p := range itemCandidates {
 		if info, ok := parseNFOFile(p); ok {
 			itemInfo = info
 			foundItem = true
@@ -88,9 +98,18 @@ func ParseLocalNFO(mediaPath string) (EnrichedInfo, bool) {
 		}
 	}
 
-	// 2. Check series-level tvshow.nfo in the item's folder or parent folder (e.g. Show/Season 01/).
+	// 2. For movies, never inherit series-level tvshow.nfo from the current or parent directory.
+	if kind == "movie" {
+		if !foundItem {
+			return EnrichedInfo{}, false
+		}
+		return itemInfo, true
+	}
+
+	// 3. For episodes (or unspecified kind), check series-level tvshow.nfo in dir or parentDir
+	// while staying strictly inside rootPath when configured.
 	tvCandidates := []string{filepath.Join(dir, "tvshow.nfo")}
-	if parentDir != dir {
+	if parentDir != dir && (rootPath == "" || isWithinDir(rootPath, parentDir)) {
 		tvCandidates = append(tvCandidates, filepath.Join(parentDir, "tvshow.nfo"))
 	}
 	var tvInfo EnrichedInfo
@@ -107,10 +126,19 @@ func ParseLocalNFO(mediaPath string) (EnrichedInfo, bool) {
 		return EnrichedInfo{}, false
 	}
 	if !foundItem {
-		return tvInfo, true
+		// Return only series identity and explicitly shared attributes so episode-specific
+		// fields (plot, rating, air date, credits) remain empty for remote episode enrichment.
+		return EnrichedInfo{
+			SeriesTitle:   tvInfo.SeriesTitle,
+			TMDBID:        tvInfo.TMDBID,
+			IMDBID:        tvInfo.IMDBID,
+			ContentRating: tvInfo.ContentRating,
+			Genres:        tvInfo.Genres,
+			Studios:       tvInfo.Studios,
+		}, true
 	}
 	if foundTV {
-		// Inherit series-level identity and metadata missing from the episode's own .nfo.
+		// Inherit series-level identity and shared metadata missing from the episode's own .nfo.
 		if itemInfo.SeriesTitle == "" {
 			itemInfo.SeriesTitle = tvInfo.SeriesTitle
 		}
@@ -133,6 +161,14 @@ func ParseLocalNFO(mediaPath string) (EnrichedInfo, bool) {
 	return itemInfo, true
 }
 
+func isWithinDir(root, target string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(target))
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func parseNFOFile(path string) (EnrichedInfo, bool) {
 	raw, err := os.ReadFile(path)
 	if err != nil || len(raw) == 0 {
@@ -144,6 +180,7 @@ func parseNFOFile(path string) (EnrichedInfo, bool) {
 		return EnrichedInfo{}, false
 	}
 
+	isEpisodeDoc := strings.EqualFold(doc.XMLName.Local, "episodedetails")
 	info := EnrichedInfo{
 		Title:         strings.TrimSpace(doc.Title),
 		OriginalTitle: strings.TrimSpace(doc.OriginalTitle),
@@ -151,8 +188,12 @@ func parseNFOFile(path string) (EnrichedInfo, bool) {
 		Tagline:       strings.TrimSpace(doc.Tagline),
 		ContentRating: strings.TrimSpace(doc.MPAA),
 		ReleaseDate:   strings.TrimSpace(doc.Premiered),
-		TMDBID:        strings.TrimSpace(doc.TMDBID),
-		IMDBID:        strings.TrimSpace(doc.IMDBID),
+	}
+	// Episode-level <episodedetails> IDs identify the individual episode rather than the TV series,
+	// so keep them out of TMDBID/IMDBID (which represent series identity for episodes).
+	if !isEpisodeDoc {
+		info.TMDBID = strings.TrimSpace(doc.TMDBID)
+		info.IMDBID = strings.TrimSpace(doc.IMDBID)
 	}
 	if strings.EqualFold(doc.XMLName.Local, "tvshow") {
 		info.SeriesTitle = info.Title
@@ -204,16 +245,18 @@ func parseNFOFile(path string) (EnrichedInfo, bool) {
 			break
 		}
 	}
-	for _, uid := range doc.UniqueIDs {
-		val := strings.TrimSpace(uid.Value)
-		switch strings.ToLower(uid.Type) {
-		case "tmdb":
-			if info.TMDBID == "" {
-				info.TMDBID = val
-			}
-		case "imdb":
-			if info.IMDBID == "" {
-				info.IMDBID = val
+	if !isEpisodeDoc {
+		for _, uid := range doc.UniqueIDs {
+			val := strings.TrimSpace(uid.Value)
+			switch strings.ToLower(uid.Type) {
+			case "tmdb":
+				if info.TMDBID == "" {
+					info.TMDBID = val
+				}
+			case "imdb":
+				if info.IMDBID == "" {
+					info.IMDBID = val
+				}
 			}
 		}
 	}

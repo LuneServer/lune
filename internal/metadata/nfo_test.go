@@ -64,6 +64,9 @@ func TestParseLocalNFO_ParentTVShowAndEpisodeMerge(t *testing.T) {
 	tvshowNFO := `<?xml version="1.0" encoding="UTF-8"?>
 <tvshow>
   <title>The Expanse</title>
+  <plot>Series-level synopsis that must not clobber episode overview.</plot>
+  <rating>8.5</rating>
+  <premiered>2015-12-14</premiered>
   <mpaa>TV-14</mpaa>
   <genre>Sci-Fi</genre>
   <studio>Syfy</studio>
@@ -74,31 +77,53 @@ func TestParseLocalNFO_ParentTVShowAndEpisodeMerge(t *testing.T) {
 		t.Fatalf("write tvshow.nfo: %v", err)
 	}
 
-	// Episode with no own .nfo inherits series identity from parent tvshow.nfo without clobbering episode title.
+	// Episode with no own .nfo inherits series identity & shared attributes only (leaving episode plot/rating/date empty).
 	ep1 := filepath.Join(seasonDir, "The Expanse - S01E01.mkv")
-	info1, ok := ParseLocalNFO(ep1)
+	info1, ok := ParseLocalNFOForKind(showDir, ep1, "episode")
 	if !ok {
-		t.Fatal("expected ParseLocalNFO to find parent tvshow.nfo")
+		t.Fatal("expected ParseLocalNFOForKind to find parent tvshow.nfo")
 	}
 	if info1.Title != "" || info1.SeriesTitle != "The Expanse" || info1.TMDBID != "63639" || info1.IMDBID != "tt3230854" {
 		t.Fatalf("unexpected parent tvshow.nfo result: %+v", info1)
 	}
+	if info1.Overview != "" || info1.Rating != 0 || info1.ReleaseDate != "" {
+		t.Fatalf("expected series-only plot/rating/premiere to stay empty on episode fallback, got %+v", info1)
+	}
 
-	// Episode with own .nfo keeps episode title/plot and inherits missing TMDB/IMDb IDs from parent tvshow.nfo.
+	// Episode with own <episodedetails> carrying an episode-level TMDB ID must NOT override series TMDB ID from tvshow.nfo.
 	ep2 := filepath.Join(seasonDir, "The Expanse - S01E04.mkv")
 	ep2NFO := `<?xml version="1.0" encoding="UTF-8"?>
 <episodedetails>
   <title>CQB</title>
   <plot>The Donnager comes under attack.</plot>
+  <uniqueid type="tmdb">9999999</uniqueid>
 </episodedetails>`
 	if err := os.WriteFile(filepath.Join(seasonDir, "The Expanse - S01E04.nfo"), []byte(ep2NFO), 0o644); err != nil {
 		t.Fatalf("write ep2 nfo: %v", err)
 	}
-	info2, ok := ParseLocalNFO(ep2)
+	info2, ok := ParseLocalNFOForKind(showDir, ep2, "episode")
 	if !ok {
-		t.Fatal("expected ParseLocalNFO to parse episode nfo")
+		t.Fatal("expected ParseLocalNFOForKind to parse episode nfo")
 	}
 	if info2.Title != "CQB" || info2.SeriesTitle != "The Expanse" || info2.TMDBID != "63639" || info2.IMDBID != "tt3230854" {
-		t.Fatalf("unexpected merged episode nfo: %+v", info2)
+		t.Fatalf("expected series TMDB ID 63639 (not episode-level 9999999), got %+v", info2)
+	}
+
+	// Movie inside a series subfolder (e.g. Show/Movies/Film.mkv) must NEVER inherit parent tvshow.nfo.
+	moviesSub := filepath.Join(showDir, "Movies")
+	_ = os.MkdirAll(moviesSub, 0o755)
+	movieFile := filepath.Join(moviesSub, "Film (2020).mkv")
+	if infoM, ok := ParseLocalNFOForKind(showDir, movieFile, "movie"); ok {
+		t.Fatalf("movie must not inherit parent tvshow.nfo, got %+v", infoM)
+	}
+
+	// Episode sitting directly at library root must NOT read a tvshow.nfo above library root.
+	outsideRoot := t.TempDir()
+	libRoot := filepath.Join(outsideRoot, "shows")
+	_ = os.MkdirAll(libRoot, 0o755)
+	_ = os.WriteFile(filepath.Join(outsideRoot, "tvshow.nfo"), []byte(tvshowNFO), 0o644)
+	rootEp := filepath.Join(libRoot, "S01E01.mkv")
+	if infoOut, ok := ParseLocalNFOForKind(libRoot, rootEp, "episode"); ok {
+		t.Fatalf("must not traverse above library root to read tvshow.nfo, got %+v", infoOut)
 	}
 }

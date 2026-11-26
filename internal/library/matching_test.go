@@ -168,4 +168,23 @@ func TestScanner_DirectIDLookupAndPinnedTMDBSurvival(t *testing.T) {
 	if enricher.searchMovieCalls != 0 {
 		t.Fatalf("expected 0 title-search calls on force re-scan of already-matched items, got %d", enricher.searchMovieCalls)
 	}
+
+	// If an explicit local .nfo supplies an IMDb ID without a TMDB ID, do NOT restore the old retained TMDB ID.
+	nfoPath := filepath.Join(moviesRoot, "Arrival (2016).nfo")
+	_ = os.WriteFile(nfoPath, []byte(`<movie><title>Arrival</title><uniqueid type="imdb">tt2543164</uniqueid></movie>`), 0o644)
+	enricher.mu.Lock()
+	enricher.searchMovieCalls = 0
+	enricher.byIDMovieCalls = nil
+	enricher.mu.Unlock()
+
+	if _, err := svc.ScanSync(ctx, moviesLib.ID, true); err != nil {
+		t.Fatalf("force ScanSync with imdb-only nfo: %v", err)
+	}
+	afterIMDB, err := svc.GetItem(ctx, arrivalID)
+	if err != nil {
+		t.Fatalf("GetItem after imdb nfo: %v", err)
+	}
+	if afterIMDB.IMDBID != "tt2543164" || afterIMDB.TMDBID == "329865" {
+		t.Fatalf("expected imdb-only nfo not to restore stale TMDB ID 329865, got tmdb=%q imdb=%q", afterIMDB.TMDBID, afterIMDB.IMDBID)
+	}
 }

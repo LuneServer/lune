@@ -269,4 +269,16 @@ func TestParseMediaPath_ExternalIDTags(t *testing.T) {
 	if ep.SeriesTitle != "The Expanse" || ep.TMDBID != "63639" || ep.SeasonNumber == nil || *ep.SeasonNumber != 1 || ep.EpisodeNumber == nil || *ep.EpisodeNumber != 4 {
 		t.Fatalf("unexpected series folder tmdbid inheritance: %+v", ep)
 	}
+
+	// Year-like TMDB ID (2020) in folder name must NOT be mistaken for a release year or truncate the series title.
+	epYearTag := ParseMediaPath(showRoot, filepath.Join(showRoot, "Arcane {tmdb-2020}", "Season 01", "S01E01.mkv"), "shows")
+	if epYearTag.SeriesTitle != "Arcane" || epYearTag.Year != nil || epYearTag.TMDBID != "2020" {
+		t.Fatalf("year-like tmdb tag corrupted series/year: %+v", epYearTag)
+	}
+
+	animeRoot := filepath.Join(t.TempDir(), "anime")
+	animeYearTag := ParseMediaPath(animeRoot, filepath.Join(animeRoot, "Frieren {tmdb-2023}", "01.mkv"), "anime")
+	if animeYearTag.SeriesTitle != "Frieren" || animeYearTag.Year != nil || animeYearTag.TMDBID != "2023" {
+		t.Fatalf("year-like tmdb tag corrupted anime series/year: %+v", animeYearTag)
+	}
 }
