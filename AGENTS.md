@@ -86,7 +86,8 @@ lune/
 │   ├── web/                     # Static SPA handler (NewSPAHandler) for built lune-web/dist
 │   └── version/                 # Build-time Version, Commit, BuildDate (set via -ldflags)
 ├── deploy/
-│   ├── docker-compose.yml       # Single-container deployment (ports 80/443, /data, /media:ro, optional /dev/dri)
+│   ├── docker-compose.yml       # Single-container deployment (PUID/PGID/UMASK, ports 80/443 or 5863, /data, /media:ro, optional /dev/dri)
+│   ├── docker-entrypoint.sh     # PUID/PGID/UMASK privilege-drop entrypoint (gosu, /data ownership sync, /dev/dri group setup, non-root --user passthrough)
 │   └── unraid/lune.xml          # Unraid Community Applications template
 ├── docs/architecture.md         # Platform v1 blueprint & milestone roadmap
 ├── .github/workflows/           # ci.yml (vet, race test, static build) & release.yml (validated workflow_dispatch release, GitHub Release & multi-arch GHCR)
@@ -121,6 +122,8 @@ All configuration is environment-driven:
 | `LUNE_SONARR_URL` | *(empty)* | Optional env override for primary Sonarr v3 base URL |
 | `LUNE_SONARR_API_KEY` | *(empty)* | Optional env override for primary Sonarr v3 API key |
 | `LUNE_SCAN_INTERVAL` | `30m` | Periodic fallback library scan interval (`0` disables periodic scans) |
+| `LUNE_HW_ACCEL` | `auto` | Hardware transcoding backend override: `auto` (probed & verified at startup), `vaapi`, `qsv`, `nvenc`, `videotoolbox`, or `software` |
+| `LUNE_VAAPI_DEVICE` | *(auto)* | Optional explicit DRM render node (e.g. `/dev/dri/renderD128` or `/dev/dri/renderD129`); auto-scans `/dev/dri/renderD*` when unset |
 | `LUNE_TRUSTED_PROXIES` | *(empty)* | Comma-separated IPs/CIDRs allowed to supply `X-Forwarded-For` |
 | `LUNE_ADMIN_LAN_ONLY` | `false` | Restrict `/api/v1/admin/*` to loopback, RFC1918 LAN, Tailscale CGNAT (`100.64.0.0/10`), or `LUNE_IP_ALLOWLIST` |
 | `LUNE_IP_ALLOWLIST` | *(empty)* | Comma-separated IPs/CIDRs exempt from edge rate limits/auto-bans and permitted under `LUNE_ADMIN_LAN_ONLY` |

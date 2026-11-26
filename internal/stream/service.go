@@ -116,9 +116,16 @@ type ActiveStream struct {
 	LastSeenAt            time.Time `json:"last_seen_at"`
 	MaxBitrate            int64     `json:"-"`
 	MaxHeight             int       `json:"-"`
+	SourceHeight          int       `json:"-"`
 	VideoCodec            string    `json:"-"`
+	VideoProfile          string    `json:"-"`
+	VideoPixFmt           string    `json:"-"`
 	VideoHDR              string    `json:"-"`
+	DVProfile             int       `json:"-"`
+	DVCompatID            int       `json:"-"`
 	AudioCopy             bool      `json:"-"`
+	AudioChannels         int       `json:"-"`
+	MaxAudioChannels      int       `json:"-"`
 	AudioStreamIndex      *int      `json:"-"`
 	BurnSubtitleStreamIdx *int      `json:"-"`
 	StartPositionMS       int64     `json:"-"`
@@ -207,6 +214,7 @@ func (s *Service) UpdateStreamingConfig(ctx context.Context, actor store.User, c
 		return StreamingConfig{}, fmt.Errorf("%w: idle_timeout_minutes must be between 1 and 120", ErrInvalidStreamingConfig)
 	}
 
+	cfg.Transcoder = nil // diagnostics are runtime-only, never persisted
 	raw, err := json.Marshal(cfg)
 	if err != nil {
 		return StreamingConfig{}, fmt.Errorf("marshal streaming config: %w", err)
@@ -357,6 +365,16 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		resumeMS = prog.PositionMS
 	}
 
+	// Keep seekPositionMS as the exact -ss target passed to FFmpeg, while snapping resumeMS
+	// (returned to the client as its timeline/subtitle offset) to the actual start offset that
+	// FFmpeg's -noaccurate_seek -ss <seekPositionMS> + -avoid_negative_ts make_zero shifts to 0.000s.
+	seekPositionMS := resumeMS
+	if mode == "remux" && seekPositionMS > 0 {
+		if startOffsetMS, ok := s.transcoder.ResolveSeekKeyframeMS(ctx, item.FilePath, seekPositionMS); ok {
+			resumeMS = startOffsetMS
+		}
+	}
+
 	now := s.now().UTC()
 	exp := now.Add(streamTokenTTL)
 	sessionID := uuid.NewString()
@@ -399,6 +417,22 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 			replaced = append(replaced, id)
 		}
 	}
+	var videoProfile, videoPixFmt string
+	var dvProfile, dvCompatID int
+	for _, st := range streams {
+		if st.Type == "video" {
+			videoProfile = st.Profile
+			videoPixFmt = st.PixFmt
+			dvProfile = st.DVProfile
+			dvCompatID = st.DVCompatID
+			break
+		}
+	}
+	selectedAudioChannels := item.AudioChannels
+	if selectedAudioTrack != nil && selectedAudioTrack.Channels > 0 {
+		selectedAudioChannels = selectedAudioTrack.Channels
+	}
+
 	s.active[sessionID] = &ActiveStream{
 		SessionID:             sessionID,
 		UserID:                user.ID,
@@ -413,16 +447,23 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		LastSeenAt:            now,
 		MaxBitrate:            effectiveCaps.MaxBitrate,
 		MaxHeight:             effectiveCaps.MaxHeight,
+		SourceHeight:          item.VideoHeight,
 		VideoCodec:            item.VideoCodec,
+		VideoProfile:          videoProfile,
+		VideoPixFmt:           videoPixFmt,
 		VideoHDR:              item.VideoHDR,
+		DVProfile:             dvProfile,
+		DVCompatID:            dvCompatID,
 		AudioCopy:             decision.audioCopy,
+		AudioChannels:         selectedAudioChannels,
+		MaxAudioChannels:      effectiveCaps.MaxAudioChannels,
 		AudioStreamIndex:      effectiveCaps.AudioStreamIndex,
 		BurnSubtitleStreamIdx: validBurnSubIdx,
-		StartPositionMS:       resumeMS,
+		StartPositionMS:       seekPositionMS,
 	}
 	s.mu.Unlock()
 	for _, oldID := range replaced {
-		s.transcoder.Stop(oldID)
+		s.transcoder.StopAsync(oldID)
 	}
 	s.logger.Info("playback session started",
 		"session_id", sessionID,
@@ -655,9 +696,16 @@ func (s *Service) ServeHLS(w http.ResponseWriter, r *http.Request, token, fileNa
 	if ok {
 		opts.MaxBitrate = act.MaxBitrate
 		opts.MaxHeight = act.MaxHeight
+		opts.SourceHeight = act.SourceHeight
 		opts.VideoCodec = act.VideoCodec
+		opts.VideoProfile = act.VideoProfile
+		opts.VideoPixFmt = act.VideoPixFmt
 		opts.VideoHDR = act.VideoHDR
+		opts.DVProfile = act.DVProfile
+		opts.DVCompatID = act.DVCompatID
 		opts.AudioCopy = act.AudioCopy
+		opts.AudioChannels = act.AudioChannels
+		opts.MaxAudioChannels = act.MaxAudioChannels
 		opts.AudioStreamIndex = act.AudioStreamIndex
 		opts.BurnSubtitleStreamIdx = act.BurnSubtitleStreamIdx
 		opts.StartPositionMS = act.StartPositionMS
@@ -691,6 +739,16 @@ func (s *Service) ServeHLS(w http.ResponseWriter, r *http.Request, token, fileNa
 		}
 		http.Error(w, "stream unavailable", http.StatusBadGateway)
 		return
+	}
+	// Reflect actual runtime HWAccel on ActiveStream in case EnsureSession fell back to software.
+	if claims.Mode == "transcode" {
+		if actualHW := s.transcoder.SessionHWAccel(claims.SessionID); actualHW != "" {
+			s.mu.Lock()
+			if a, exists := s.active[claims.SessionID]; exists {
+				a.HWAccel = string(actualHW)
+			}
+			s.mu.Unlock()
+		}
 	}
 
 	switch {
@@ -748,8 +806,13 @@ func (s *Service) ServeSubtitle(w http.ResponseWriter, r *http.Request, token, i
 			return
 		}
 		cacheKey := fmt.Sprintf("%s_%d", item.ID, item.FileMtime)
-		vttPath, err := s.transcoder.ExtractSubtitleVTT(r.Context(), cacheKey, item.FilePath, streamIdx)
-		if err != nil {
+		var startSec float64
+		if rawStart := strings.TrimSpace(r.URL.Query().Get("start")); rawStart != "" {
+			if parsed, pErr := strconv.ParseFloat(rawStart, 64); pErr == nil && parsed > 0 {
+				startSec = parsed
+			}
+		}
+		if err := s.transcoder.StreamSubtitleVTT(r.Context(), w, r, cacheKey, item.FilePath, streamIdx, startSec); err != nil {
 			if errors.Is(err, ErrFFmpegUnavailable) {
 				http.Error(w, "ffmpeg unavailable for embedded subtitle extraction", http.StatusNotImplemented)
 				return
@@ -757,9 +820,6 @@ func (s *Service) ServeSubtitle(w http.ResponseWriter, r *http.Request, token, i
 			http.Error(w, "failed to extract subtitle", http.StatusBadGateway)
 			return
 		}
-		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
-		w.Header().Set("Cache-Control", "private, max-age=3600")
-		http.ServeFile(w, r, vttPath)
 		return
 	}
 
@@ -1030,10 +1090,15 @@ func choosePlaybackMode(item store.MediaItem, caps ClientCapabilities, ffmpegAva
 }
 
 func evaluatePlayback(item store.MediaItem, streams []metadata.StreamInfo, selectedAudio *AudioTrackDTO, caps ClientCapabilities, ffmpegAvailable bool) playbackDecision {
-	videoProfile := ""
+	var videoProfile, videoPixFmt, videoCodecTag string
+	var dvProfile, dvCompatID int
 	for _, st := range streams {
 		if st.Type == "video" {
 			videoProfile = st.Profile
+			videoPixFmt = st.PixFmt
+			videoCodecTag = st.CodecTag
+			dvProfile = st.DVProfile
+			dvCompatID = st.DVCompatID
 			break
 		}
 	}
@@ -1083,20 +1148,39 @@ func evaluatePlayback(item store.MediaItem, streams []metadata.StreamInfo, selec
 	}
 
 	containerOK := len(caps.Containers) == 0 || item.Container == "" || containsFold(caps.Containers, item.Container)
+	// Safari/Apple/MSE players reject MP4/M4V/MOV files tagged as "hev1" (require "hvc1"); remux fixes the tag cheaply.
+	if containerOK &&
+		(strings.EqualFold(item.VideoCodec, "hevc") || strings.EqualFold(item.VideoCodec, "h265")) &&
+		strings.EqualFold(videoCodecTag, "hev1") &&
+		isMP4FamilyContainer(item.Container) {
+		containerOK = false
+	}
+
 	videoCodecOK := len(caps.VideoCodecs) == 0 || item.VideoCodec == "" || containsFold(caps.VideoCodecs, item.VideoCodec)
+
+	hasHDR10BaseLayer := strings.EqualFold(item.VideoHDR, "dovi_hdr10") ||
+		dvProfile == 7 || (dvProfile == 8 && (dvCompatID == 1 || dvCompatID == 6))
+	isDoVi := strings.EqualFold(item.VideoHDR, "dovi") || strings.EqualFold(item.VideoHDR, "dovi_hdr10")
 
 	profileOK := true
 	profileReason := ""
-	if strings.EqualFold(item.VideoCodec, "h264") && is10BitProfile(videoProfile) && caps.Supports10BitH264 != nil && !*caps.Supports10BitH264 {
+	if (strings.EqualFold(item.VideoCodec, "h264") || strings.EqualFold(item.VideoCodec, "avc")) &&
+		is10BitVideo(videoProfile, videoPixFmt) && caps.Supports10BitH264 != nil && !*caps.Supports10BitH264 {
 		profileOK = false
 		profileReason = "10-bit H.264 requires transcoding for this client"
-	} else if strings.EqualFold(item.VideoCodec, "hevc") && (is10BitProfile(videoProfile) || isHDRSource(item.VideoHDR)) && caps.Supports10BitHEVC != nil && !*caps.Supports10BitHEVC {
+	} else if (strings.EqualFold(item.VideoCodec, "hevc") || strings.EqualFold(item.VideoCodec, "h265")) &&
+		(is10BitVideo(videoProfile, videoPixFmt) || isHDRSource(item.VideoHDR)) && caps.Supports10BitHEVC != nil && !*caps.Supports10BitHEVC {
 		profileOK = false
 		profileReason = "10-bit HEVC requires transcoding for this client"
-	} else if strings.EqualFold(item.VideoHDR, "dovi") && caps.SupportsDoVi != nil && !*caps.SupportsDoVi {
-		profileOK = false
-		profileReason = "Dolby Vision requires SDR transcoding for this client"
-	} else if isHDRSource(item.VideoHDR) && !strings.EqualFold(item.VideoHDR, "dovi") && caps.SupportsHDR != nil && !*caps.SupportsHDR {
+	} else if isDoVi && caps.SupportsDoVi != nil && !*caps.SupportsDoVi {
+		if hasHDR10BaseLayer && caps.SupportsHDR != nil && *caps.SupportsHDR {
+			// Dolby Vision Profile 7/8 with HDR10 base layer can remux cleanly to HDR10 hvc1 without video transcoding.
+			containerOK = false
+		} else {
+			profileOK = false
+			profileReason = "Dolby Vision requires SDR transcoding for this client"
+		}
+	} else if isHDRSource(item.VideoHDR) && !isDoVi && caps.SupportsHDR != nil && !*caps.SupportsHDR {
 		profileOK = false
 		profileReason = "HDR video requires SDR transcoding for this client"
 	}
@@ -1141,7 +1225,26 @@ func evaluatePlayback(item store.MediaItem, streams []metadata.StreamInfo, selec
 
 func is10BitProfile(profile string) bool {
 	p := strings.ToLower(strings.TrimSpace(profile))
-	return strings.Contains(p, "10") || strings.Contains(p, "rext")
+	return strings.Contains(p, "10") || strings.Contains(p, "rext") || p == "profile 2"
+}
+
+func is10BitPixFmt(pixFmt string) bool {
+	pf := strings.ToLower(strings.TrimSpace(pixFmt))
+	return strings.Contains(pf, "10le") || strings.Contains(pf, "10be") || strings.Contains(pf, "p010") ||
+		strings.Contains(pf, "12le") || strings.Contains(pf, "12be")
+}
+
+func is10BitVideo(profile, pixFmt string) bool {
+	return is10BitProfile(profile) || is10BitPixFmt(pixFmt)
+}
+
+func isMP4FamilyContainer(container string) bool {
+	switch strings.ToLower(strings.TrimSpace(container)) {
+	case "mp4", "m4v", "mov":
+		return true
+	default:
+		return false
+	}
 }
 
 func canRemuxVideoInFMP4(codec string) bool {
