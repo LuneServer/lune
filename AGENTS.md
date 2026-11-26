@@ -4,7 +4,7 @@ This document describes the architecture, conventions, and engineering invariant
 
 > **Mandatory Branch Workflow:** Never commit directly to `main` or pile unrelated changes onto an existing branch. Start every distinct task (feature, fix, or doc change) on its own branch from an up-to-date local `main` (fetch and fast-forward `main` first, then `git switch -c <type>/<short-topic> main`, e.g. `fix/unraid-permissions`; if local `main` cannot fast-forward to `origin/main` or has commits not on `origin/main`, use the freshly fetched `origin/main` as the start point instead). For parallel or concurrent work, or when the working tree already holds uncommitted changes from another task, use a separate worktree (`git worktree add ../lune-worktrees/<topic>/lune -b <type>/<topic> main`, substituting the freshly fetched `origin/main` as the base under the same fallback) instead of switching branches in place; for cross-repo tasks put all three worktrees under the same `../lune-worktrees/<topic>/` parent (`lune`, `lune-web`, `lune-brand`) so the `../lune-web`/`../lune-brand` paths below resolve to the task branches. Keep each branch scoped to one concern, run `git status` before editing to confirm what you're building on, and when a task spans repos (`lune`, `lune-web`, `lune-brand`), use a same-named branch in each. Do not merge, rebase onto, or push unless the user asks.
 
-> **Mandatory Maintenance Rule:** Whenever you implement new functionality or change existing architecture (packages, HTTP endpoints, SQLite migrations, environment variables, streaming behavior, deployment manifests, or cross-repo contracts), **you must update this `AGENTS.md` in the same change**. If the change alters platform-level architecture, also update [`docs/architecture.md`](docs/architecture.md), and if it changes API contracts or static asset expectations consumed by the web client, update `lune-web/AGENTS.md` accordingly.
+> **Mandatory Maintenance Rule:** Whenever you implement new functionality or change existing architecture (packages, HTTP endpoints, SQLite migrations, environment variables, streaming behavior, deployment manifests, or cross-repo contracts), **you must update this `AGENTS.md` in the same change**. If it changes API contracts or static asset expectations consumed by the web client, update `lune-web/AGENTS.md` accordingly.
 
 ---
 
@@ -89,7 +89,6 @@ lune/
 │   ├── docker-compose.yml       # Single-container deployment (PUID/PGID/UMASK, ports 80/443 or 5863, /data, /media:ro, optional /dev/dri)
 │   ├── docker-entrypoint.sh     # PUID/PGID/UMASK privilege-drop entrypoint (gosu, /data ownership sync, /dev/dri group setup, non-root --user passthrough)
 │   └── unraid/lune.xml          # Unraid Community Applications template
-├── docs/architecture.md         # Platform v1 blueprint & milestone roadmap
 ├── .github/workflows/           # ci.yml (vet, race test, static build) & release.yml (validated workflow_dispatch release, GitHub Release & multi-arch GHCR)
 └── Dockerfile                   # Multi-stage static Go build + Debian bookworm-slim + FFmpeg runtime
 ```
@@ -193,6 +192,5 @@ LUNE_WEB_DIR=../lune-web/dist go run ./cmd/lune
 
 When implementing new functionality in `lune`, check and update:
 1. **This file (`AGENTS.md`):** Update the package layout, environment variable table, invariants, or verification commands whenever they change.
-2. **`docs/architecture.md`:** Keep the high-level blueprint and milestone progress aligned with significant architectural additions.
-3. **`deploy/docker-compose.yml` & `deploy/unraid/lune.xml`:** Add any new user-facing `LUNE_*` environment variables or volume/device requirements.
-4. **Cross-repo impact:** If you add or modify `/api/v1/*` routes or DTO fields, note or apply matching updates in `../lune-web/src/lib/api.ts` and `../lune-web/AGENTS.md`. Make those edits on the same-named branch in `../lune-web` (or in the matching worktree when that checkout has uncommitted changes from another task), never on whatever branch happens to be checked out there.
+2. **`deploy/docker-compose.yml` & `deploy/unraid/lune.xml`:** Add any new user-facing `LUNE_*` environment variables or volume/device requirements.
+3. **Cross-repo impact:** If you add or modify `/api/v1/*` routes or DTO fields, note or apply matching updates in `../lune-web/src/lib/api.ts` and `../lune-web/AGENTS.md`. Make those edits on the same-named branch in `../lune-web` (or in the matching worktree when that checkout has uncommitted changes from another task), never on whatever branch happens to be checked out there.
