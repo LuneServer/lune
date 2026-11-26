@@ -45,6 +45,12 @@ type PersonArtFetcher interface {
 	FetchPersonPhoto(ctx context.Context, profilePath string) (string, error)
 }
 
+// LazyArtFetcher materializes sharded TMDB artwork files (episode stills, backdrops,
+// or missing posters) on demand when a referenced cache path is not yet on disk.
+type LazyArtFetcher interface {
+	EnsureArtwork(ctx context.Context, localPath string) (string, error)
+}
+
 // MetadataSearchResult represents a single selectable TMDB candidate for visual admin re-matching.
 type MetadataSearchResult struct {
 	TMDBID        string  `json:"tmdb_id"`
@@ -315,12 +321,12 @@ func (c *TMDBClient) enrichMovieByID(ctx context.Context, itemID string, movieID
 	}
 
 	if detail.PosterPath != "" {
-		if p, err := c.downloadArtworkOpts(ctx, itemID, "poster.jpg", "/w780"+detail.PosterPath, forceArtwork); err == nil {
+		if p, err := c.downloadTMDBArtwork(ctx, "w780", detail.PosterPath, forceArtwork); err == nil {
 			info.PosterPath = p
 		}
 	}
 	if detail.BackdropPath != "" {
-		if p, err := c.downloadArtworkOpts(ctx, itemID, "backdrop.jpg", "/w1280"+detail.BackdropPath, forceArtwork); err == nil {
+		if _, _, p, ok := c.tmdbArtworkPath("w1280", detail.BackdropPath); ok {
 			info.BackdropPath = p
 		}
 	}
@@ -487,7 +493,7 @@ func (c *TMDBClient) enrichEpisodeWithShow(ctx context.Context, itemID string, s
 				}
 			}
 			if epDetail.StillPath != "" {
-				if p, err := c.downloadArtworkOpts(ctx, itemID, "backdrop.jpg", "/w1280"+epDetail.StillPath, forceArtwork); err == nil {
+				if _, _, p, ok := c.tmdbArtworkPath("w1280", epDetail.StillPath); ok {
 					info.BackdropPath = p
 				}
 			}
@@ -497,15 +503,15 @@ func (c *TMDBClient) enrichEpisodeWithShow(ctx context.Context, itemID string, s
 		info.Writers = append([]string(nil), show.creators...)
 	}
 
-	// Cache series poster under a shared series key so 100 episodes only download the poster once.
-	seriesArtKey := fmt.Sprintf("tv-%d", show.id)
+	// Cache series poster under a content-addressed sharded TMDB path so all episodes share
+	// one file and re-scans/upgrades never duplicate it. Backdrops and stills are fetched lazily.
 	if show.posterPath != "" {
-		if p, err := c.downloadArtwork(ctx, seriesArtKey, "poster.jpg", "/w780"+show.posterPath); err == nil {
+		if p, err := c.downloadTMDBArtwork(ctx, "w780", show.posterPath, false); err == nil {
 			info.PosterPath = p
 		}
 	}
 	if info.BackdropPath == "" && show.backdropPath != "" {
-		if p, err := c.downloadArtwork(ctx, seriesArtKey, "backdrop.jpg", "/w1280"+show.backdropPath); err == nil {
+		if _, _, p, ok := c.tmdbArtworkPath("w1280", show.backdropPath); ok {
 			info.BackdropPath = p
 		}
 	}
@@ -1542,6 +1548,86 @@ func (c *TMDBClient) FetchPersonPhoto(ctx context.Context, profilePath string) (
 		}
 	}
 	return c.downloadArtwork(ctx, "people", clean, "/w185/"+clean)
+}
+
+// EnsureArtwork lazily materializes a sharded TMDB artwork file under <DataDir>/artwork/tmdb/
+// when it is referenced in the database (e.g. an episode still, backdrop, or missing poster)
+// but not yet cached on disk.
+func (c *TMDBClient) EnsureArtwork(ctx context.Context, localPath string) (string, error) {
+	if c == nil {
+		return "", fmt.Errorf("%w: tmdb client not configured", ErrArtworkNotFound)
+	}
+	cleanPath := filepath.Clean(localPath)
+	tmdbRoot := filepath.Clean(filepath.Join(c.artworkDir, "tmdb"))
+	rel, err := filepath.Rel(tmdbRoot, cleanPath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("%w: path outside tmdb artwork cache", ErrArtworkNotFound)
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("%w: invalid tmdb artwork cache path", ErrArtworkNotFound)
+	}
+	size, shard, filename := parts[0], parts[1], parts[2]
+	if !isAllowedTMDBArtSize(size) || !isSafeArtFilename(filename) || shard != artShard(filename) {
+		return "", fmt.Errorf("%w: invalid tmdb artwork cache key", ErrArtworkNotFound)
+	}
+	if info, err := os.Stat(cleanPath); err == nil && !info.IsDir() && info.Size() > 0 {
+		return cleanPath, nil
+	}
+	if c.personArtSem != nil {
+		select {
+		case c.personArtSem <- struct{}{}:
+			defer func() { <-c.personArtSem }()
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return c.downloadArtwork(ctx, filepath.Join("tmdb", size, shard), filename, "/"+size+"/"+filename)
+}
+
+func (c *TMDBClient) downloadTMDBArtwork(ctx context.Context, size, rawPath string, force bool) (string, error) {
+	subdir, clean, _, ok := c.tmdbArtworkPath(size, rawPath)
+	if !ok {
+		return "", fmt.Errorf("%w: invalid tmdb artwork path", ErrArtworkNotFound)
+	}
+	return c.downloadArtworkOpts(ctx, subdir, clean, "/"+size+"/"+clean, force)
+}
+
+func (c *TMDBClient) tmdbArtworkPath(size, rawPath string) (subdir, clean, fullPath string, ok bool) {
+	if !isAllowedTMDBArtSize(size) {
+		return "", "", "", false
+	}
+	clean = strings.TrimPrefix(strings.TrimSpace(rawPath), "/")
+	if !isSafeArtFilename(clean) {
+		return "", "", "", false
+	}
+	subdir = filepath.Join("tmdb", size, artShard(clean))
+	fullPath = filepath.Join(c.artworkDir, subdir, clean)
+	return subdir, clean, fullPath, true
+}
+
+func isAllowedTMDBArtSize(size string) bool {
+	return size == "w780" || size == "w1280" || size == "w185"
+}
+
+func artShard(filename string) string {
+	var b [2]byte
+	n := 0
+	for i := 0; i < len(filename) && n < 2; i++ {
+		ch := filename[i]
+		if ch >= 'A' && ch <= 'Z' {
+			ch += 'a' - 'A'
+		}
+		if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') {
+			b[n] = ch
+			n++
+		}
+	}
+	for n < 2 {
+		b[n] = '0'
+		n++
+	}
+	return string(b[:])
 }
 
 func isSafeArtFilename(name string) bool {

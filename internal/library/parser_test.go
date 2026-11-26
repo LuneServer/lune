@@ -313,4 +313,10 @@ func TestParseMediaPath_ExternalIDTags(t *testing.T) {
 	if animeYearTag.SeriesTitle != "Frieren" || animeYearTag.Year != nil || animeYearTag.TMDBID != "2023" {
 		t.Fatalf("year-like tmdb tag corrupted anime series/year: %+v", animeYearTag)
 	}
+
+	// Movie beneath a tagged series folder (e.g. Show {tmdb-37854}/Movies/Film (2022).mkv) must NOT inherit the series ID.
+	animeFilm := ParseMediaPath(animeRoot, filepath.Join(animeRoot, "One Piece {tmdb-37854}", "Movies", "Film Red (2022).mkv"), "anime")
+	if animeFilm.Kind != "movie" || animeFilm.TMDBID != "" {
+		t.Fatalf("movie beneath tagged series folder must not inherit series TMDB ID: %+v", animeFilm)
+	}
 }

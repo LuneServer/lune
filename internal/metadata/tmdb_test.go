@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -361,5 +363,153 @@ func TestPickBestTMDBCandidate_Scoring(t *testing.T) {
 	}
 	if got := pickBestTMDBCandidate(animeResults, "One Piece", nil, true); got != 37854 {
 		t.Fatalf("expected anime One Piece ID 37854, got %d", got)
+	}
+}
+
+func TestTMDBClient_ShardedDeduplicationAndLazyBackdrops(t *testing.T) {
+	var posterHits atomic.Int32
+	var backdropHits atomic.Int32
+	var stillHits atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/movie/157336":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"id": 157336,
+				"title": "Interstellar",
+				"poster_path": "/InterstellarPoster.jpg",
+				"backdrop_path": "/InterstellarBG.jpg"
+			}`))
+		case "/tv/63639":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"id": 63639,
+				"name": "The Expanse",
+				"poster_path": "/ExpansePoster.jpg",
+				"backdrop_path": "/ExpanseBG.jpg"
+			}`))
+		case "/tv/63639/season/1/episode/1":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"name": "Dulcinea",
+				"still_path": "/Ep1Still.jpg"
+			}`))
+		case "/w780/InterstellarPoster.jpg":
+			posterHits.Add(1)
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte("poster-bytes"))
+		case "/w780/ExpansePoster.jpg":
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte("series-poster-bytes"))
+		case "/w1280/InterstellarBG.jpg":
+			backdropHits.Add(1)
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte("backdrop-bytes"))
+		case "/w1280/Ep1Still.jpg":
+			stillHits.Add(1)
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write([]byte("still-bytes"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	dataDir := t.TempDir()
+	client := NewTMDBClient("test-key", srv.URL, dataDir)
+	client.imageBase = srv.URL
+
+	ctx := context.Background()
+
+	// 1. Two distinct movie items (e.g. 4K + 1080p versions) share one sharded poster file.
+	m1, err := client.enrichMovieByID(ctx, "movie-4k", 157336, false)
+	if err != nil {
+		t.Fatalf("enrichMovieByID m1: %v", err)
+	}
+	m2, err := client.enrichMovieByID(ctx, "movie-1080p", 157336, false)
+	if err != nil {
+		t.Fatalf("enrichMovieByID m2: %v", err)
+	}
+	wantPoster := filepath.Join(dataDir, "artwork", "tmdb", "w780", "in", "InterstellarPoster.jpg")
+	if m1.PosterPath != wantPoster || m2.PosterPath != wantPoster {
+		t.Fatalf("expected deduplicated sharded poster %q, got %q and %q", wantPoster, m1.PosterPath, m2.PosterPath)
+	}
+	if posterHits.Load() != 1 {
+		t.Fatalf("expected 1 poster download across two movie versions, got %d", posterHits.Load())
+	}
+
+	// 2. Movie backdrop is recorded deterministically but NOT downloaded during scan.
+	wantBackdrop := filepath.Join(dataDir, "artwork", "tmdb", "w1280", "in", "InterstellarBG.jpg")
+	if m1.BackdropPath != wantBackdrop {
+		t.Fatalf("expected lazy sharded backdrop %q, got %q", wantBackdrop, m1.BackdropPath)
+	}
+	if backdropHits.Load() != 0 {
+		t.Fatalf("expected 0 eager backdrop downloads during scan, got %d", backdropHits.Load())
+	}
+	if _, err := os.Stat(wantBackdrop); !os.IsNotExist(err) {
+		t.Fatalf("expected backdrop not yet on disk before lazy fetch, stat err=%v", err)
+	}
+	resolvedBG, err := client.EnsureArtwork(ctx, m1.BackdropPath)
+	if err != nil || resolvedBG != wantBackdrop {
+		t.Fatalf("EnsureArtwork backdrop failed: path=%q err=%v", resolvedBG, err)
+	}
+	if backdropHits.Load() != 1 {
+		t.Fatalf("expected 1 lazy backdrop download, got %d", backdropHits.Load())
+	}
+	// Second EnsureArtwork hits disk cache without re-fetching.
+	if _, err := client.EnsureArtwork(ctx, m1.BackdropPath); err != nil {
+		t.Fatalf("second EnsureArtwork backdrop failed: %v", err)
+	}
+	if backdropHits.Load() != 1 {
+		t.Fatalf("expected cached backdrop to skip upstream fetch, got %d hits", backdropHits.Load())
+	}
+
+	// 3. Episode still is NOT downloaded during scan, and materializes lazily via EnsureArtwork.
+	ep, err := client.EnrichEpisodeByTMDBID(ctx, "ep-1", "63639", 1, 1, 0, false)
+	if err != nil {
+		t.Fatalf("EnrichEpisodeByTMDBID: %v", err)
+	}
+	wantStill := filepath.Join(dataDir, "artwork", "tmdb", "w1280", "ep", "Ep1Still.jpg")
+	if ep.BackdropPath != wantStill {
+		t.Fatalf("expected lazy sharded still %q, got %q", wantStill, ep.BackdropPath)
+	}
+	if stillHits.Load() != 0 {
+		t.Fatalf("expected 0 eager episode still downloads during scan, got %d", stillHits.Load())
+	}
+	resolvedStill, err := client.EnsureArtwork(ctx, ep.BackdropPath)
+	if err != nil || resolvedStill != wantStill {
+		t.Fatalf("EnsureArtwork still failed: path=%q err=%v", resolvedStill, err)
+	}
+	if b, err := os.ReadFile(resolvedStill); err != nil || string(b) != "still-bytes" {
+		t.Fatalf("unexpected cached still bytes: %q (err=%v)", string(b), err)
+	}
+	if stillHits.Load() != 1 {
+		t.Fatalf("expected 1 lazy still download, got %d", stillHits.Load())
+	}
+
+	// 4. Security: EnsureArtwork rejects paths outside artwork/tmdb, wrong shards, or invalid sizes.
+	badPaths := []string{
+		filepath.Join(dataDir, "artwork", "legacy-uuid", "poster.jpg"),
+		filepath.Join(dataDir, "artwork", "tmdb", "original", "ep", "Ep1Still.jpg"),
+		filepath.Join(dataDir, "artwork", "tmdb", "w1280", "zz", "Ep1Still.jpg"),
+		filepath.Join(dataDir, "artwork", "tmdb", "w1280", "ep", "..", "secret.jpg"),
+		"/etc/passwd",
+	}
+	for _, bp := range badPaths {
+		if _, err := client.EnsureArtwork(ctx, bp); !errors.Is(err, ErrArtworkNotFound) {
+			t.Fatalf("expected ErrArtworkNotFound for %q, got %v", bp, err)
+		}
+	}
+
+	// 5. Missing poster self-heals on EnsureArtwork if cache directory was wiped.
+	if err := os.Remove(wantPoster); err != nil {
+		t.Fatalf("remove cached poster: %v", err)
+	}
+	if p, err := client.EnsureArtwork(ctx, wantPoster); err != nil || !strings.HasSuffix(p, "InterstellarPoster.jpg") {
+		t.Fatalf("expected poster self-heal, got path=%q err=%v", p, err)
+	}
+	if posterHits.Load() != 2 {
+		t.Fatalf("expected poster self-heal to re-fetch once, got %d hits", posterHits.Load())
 	}
 }
