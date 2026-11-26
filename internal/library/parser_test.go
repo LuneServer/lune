@@ -264,6 +264,16 @@ func TestParseMediaPath_ExternalIDTags(t *testing.T) {
 		t.Fatalf("unexpected bracket tmdbid + imdb parse: %+v", m2)
 	}
 
+	seriesDir := filepath.Join(movieRoot, "Series {tmdb-63639} {imdb-tt3230854}")
+	m3 := ParseMediaPath(movieRoot, filepath.Join(seriesDir, "Movies", "Film.mkv"), "movies")
+	if m3.Kind != "movie" || m3.TMDBID != "" || m3.IMDBID != "" {
+		t.Fatalf("movie inherited an ancestor series ID: %+v", m3)
+	}
+	m4 := ParseMediaPath(movieRoot, filepath.Join(seriesDir, "Film {tmdb-129}", "Film {imdb-tt0245429}.mkv"), "movies")
+	if m4.TMDBID != "129" || m4.IMDBID != "tt0245429" {
+		t.Fatalf("movie lost its own folder or filename ID: %+v", m4)
+	}
+
 	showRoot := filepath.Join(t.TempDir(), "shows")
 	ep := ParseMediaPath(showRoot, filepath.Join(showRoot, "The Expanse (2015) [tmdbid-63639]", "Season 01", "S01E04 - CQB.mkv"), "shows")
 	if ep.SeriesTitle != "The Expanse" || ep.TMDBID != "63639" || ep.SeasonNumber == nil || *ep.SeasonNumber != 1 || ep.EpisodeNumber == nil || *ep.EpisodeNumber != 4 {

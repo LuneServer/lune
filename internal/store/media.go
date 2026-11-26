@@ -63,6 +63,8 @@ type MediaItem struct {
 	CastJSON              string
 	TMDBID                string
 	IMDBID                string
+	EpisodeTMDBID         string
+	EpisodeIMDBID         string
 	MetadataVersion       int
 	ProbedAt              *time.Time
 	CreatedAt             time.Time
@@ -246,13 +248,13 @@ const upsertMediaItemSQL = `
 		poster_path, backdrop_path,
 		overview, tagline, rating, genres_json,
 		content_rating, release_date, directors_json, writers_json, studios_json, cast_json,
-		tmdb_id, imdb_id, metadata_version, probed_at
+		tmdb_id, imdb_id, episode_tmdb_id, episode_imdb_id, metadata_version, probed_at
 	) VALUES (
 		?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 		?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 		?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 		?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-		?, ?, ?, ?
+		?, ?, ?, ?, ?, ?
 	)
 	ON CONFLICT(file_path) DO UPDATE SET
 		library_id              = excluded.library_id,
@@ -295,6 +297,8 @@ const upsertMediaItemSQL = `
 		cast_json               = excluded.cast_json,
 		tmdb_id                 = excluded.tmdb_id,
 		imdb_id                 = excluded.imdb_id,
+		episode_tmdb_id         = excluded.episode_tmdb_id,
+		episode_imdb_id         = excluded.episode_imdb_id,
 		metadata_version        = excluded.metadata_version,
 		probed_at               = excluded.probed_at,
 		updated_at              = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -335,7 +339,7 @@ func mediaItemUpsertArgs(item MediaItem) []any {
 		item.PosterPath, item.BackdropPath,
 		item.Overview, item.Tagline, item.Rating, genresJSON,
 		item.ContentRating, item.ReleaseDate, directorsJSON, writersJSON, studiosJSON, castJSON,
-		item.TMDBID, item.IMDBID, item.MetadataVersion, probedAt,
+		item.TMDBID, item.IMDBID, item.EpisodeTMDBID, item.EpisodeIMDBID, item.MetadataVersion, probedAt,
 	}
 }
 
@@ -416,7 +420,7 @@ const mediaItemColumns = `id, library_id, kind, title, original_title, sort_titl
 		       poster_path, backdrop_path,
 		       overview, tagline, rating, genres_json,
 		       content_rating, release_date, directors_json, writers_json, studios_json, cast_json,
-		       tmdb_id, imdb_id, metadata_version,
+		       tmdb_id, imdb_id, episode_tmdb_id, episode_imdb_id, metadata_version,
 		       probed_at, created_at, updated_at`
 
 const mediaItemColumnsM = `m.id, m.library_id, m.kind, m.title, m.original_title, m.sort_title, m.year,
@@ -427,7 +431,7 @@ const mediaItemColumnsM = `m.id, m.library_id, m.kind, m.title, m.original_title
 		       m.poster_path, m.backdrop_path,
 		       m.overview, m.tagline, m.rating, m.genres_json,
 		       m.content_rating, m.release_date, m.directors_json, m.writers_json, m.studios_json, m.cast_json,
-		       m.tmdb_id, m.imdb_id, m.metadata_version,
+		       m.tmdb_id, m.imdb_id, m.episode_tmdb_id, m.episode_imdb_id, m.metadata_version,
 		       m.probed_at, m.created_at, m.updated_at`
 
 func (s *Store) GetMediaItem(ctx context.Context, id string) (MediaItem, error) {
@@ -1007,7 +1011,7 @@ func scanMediaItem(row rowScanner) (MediaItem, error) {
 		&m.PosterPath, &m.BackdropPath,
 		&m.Overview, &m.Tagline, &m.Rating, &m.GenresJSON,
 		&m.ContentRating, &m.ReleaseDate, &m.DirectorsJSON, &m.WritersJSON, &m.StudiosJSON, &m.CastJSON,
-		&m.TMDBID, &m.IMDBID, &m.MetadataVersion,
+		&m.TMDBID, &m.IMDBID, &m.EpisodeTMDBID, &m.EpisodeIMDBID, &m.MetadataVersion,
 		&probedStr, &createdStr, &updatedStr,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

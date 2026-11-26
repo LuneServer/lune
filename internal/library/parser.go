@@ -99,7 +99,7 @@ func ParseMediaPath(rootPath, fullPath, libraryKind string) ParsedFile {
 		out.SortTitle = makeSortTitle(out.Title)
 	}
 
-	out.TMDBID, out.IMDBID = extractPathExternalIDs(rootPath, fullPath, base)
+	out.TMDBID, out.IMDBID = extractPathExternalIDs(rootPath, fullPath, base, out.Kind != "movie")
 	out.PosterPath, out.BackdropPath = findSidecarArtwork(rootPath, dir)
 	return out
 }
@@ -544,9 +544,9 @@ func extractReleaseGroup(base string) string {
 	return cand
 }
 
-// extractPathExternalIDs inspects the filename and parent folders under rootPath for explicit
-// provider ID tags such as {tmdb-438631}, [tmdbid-438631], (tmdb-438631), or {imdb-tt1160419}.
-func extractPathExternalIDs(rootPath, fullPath, base string) (tmdbID, imdbID string) {
+// extractPathExternalIDs checks the filename and its folder for provider tags.
+// For episodes, ancestor folders can also supply series IDs.
+func extractPathExternalIDs(rootPath, fullPath, base string, includeAncestors bool) (tmdbID, imdbID string) {
 	check := func(s string) {
 		if tmdbID == "" {
 			if m := rePathTMDBID.FindStringSubmatch(s); len(m) > 1 {
@@ -570,7 +570,7 @@ func extractPathExternalIDs(rootPath, fullPath, base string) (tmdbID, imdbID str
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	for i := len(parts) - 1; i >= 0; i-- {
 		check(parts[i])
-		if tmdbID != "" && imdbID != "" {
+		if !includeAncestors || (tmdbID != "" && imdbID != "") {
 			break
 		}
 	}

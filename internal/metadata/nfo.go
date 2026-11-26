@@ -35,6 +35,8 @@ type EnrichedInfo struct {
 	Cast          []CreditPerson
 	TMDBID        string
 	IMDBID        string
+	EpisodeTMDBID string
+	EpisodeIMDBID string
 	PosterPath    string
 	BackdropPath  string
 	MappedSeason  *int
@@ -91,7 +93,7 @@ func ParseLocalNFOForKind(rootPath, mediaPath, kind string) (EnrichedInfo, bool)
 	var itemInfo EnrichedInfo
 	foundItem := false
 	for _, p := range itemCandidates {
-		if info, ok := parseNFOFile(p); ok {
+		if info, ok := parseNFOFile(p, kind == "episode"); ok {
 			itemInfo = info
 			foundItem = true
 			break
@@ -115,7 +117,7 @@ func ParseLocalNFOForKind(rootPath, mediaPath, kind string) (EnrichedInfo, bool)
 	var tvInfo EnrichedInfo
 	foundTV := false
 	for _, p := range tvCandidates {
-		if info, ok := parseNFOFile(p); ok {
+		if info, ok := parseNFOFile(p, false); ok {
 			tvInfo = info
 			foundTV = true
 			break
@@ -169,7 +171,7 @@ func isWithinDir(root, target string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func parseNFOFile(path string) (EnrichedInfo, bool) {
+func parseNFOFile(path string, episodeSidecar bool) (EnrichedInfo, bool) {
 	raw, err := os.ReadFile(path)
 	if err != nil || len(raw) == 0 {
 		return EnrichedInfo{}, false
@@ -180,7 +182,7 @@ func parseNFOFile(path string) (EnrichedInfo, bool) {
 		return EnrichedInfo{}, false
 	}
 
-	isEpisodeDoc := strings.EqualFold(doc.XMLName.Local, "episodedetails")
+	isEpisodeDoc := episodeSidecar || strings.EqualFold(doc.XMLName.Local, "episodedetails")
 	info := EnrichedInfo{
 		Title:         strings.TrimSpace(doc.Title),
 		OriginalTitle: strings.TrimSpace(doc.OriginalTitle),
@@ -188,12 +190,6 @@ func parseNFOFile(path string) (EnrichedInfo, bool) {
 		Tagline:       strings.TrimSpace(doc.Tagline),
 		ContentRating: strings.TrimSpace(doc.MPAA),
 		ReleaseDate:   strings.TrimSpace(doc.Premiered),
-	}
-	// Episode-level <episodedetails> IDs identify the individual episode rather than the TV series,
-	// so keep them out of TMDBID/IMDBID (which represent series identity for episodes).
-	if !isEpisodeDoc {
-		info.TMDBID = strings.TrimSpace(doc.TMDBID)
-		info.IMDBID = strings.TrimSpace(doc.IMDBID)
 	}
 	if strings.EqualFold(doc.XMLName.Local, "tvshow") {
 		info.SeriesTitle = info.Title
@@ -245,20 +241,25 @@ func parseNFOFile(path string) (EnrichedInfo, bool) {
 			break
 		}
 	}
-	if !isEpisodeDoc {
-		for _, uid := range doc.UniqueIDs {
-			val := strings.TrimSpace(uid.Value)
-			switch strings.ToLower(uid.Type) {
-			case "tmdb":
-				if info.TMDBID == "" {
-					info.TMDBID = val
-				}
-			case "imdb":
-				if info.IMDBID == "" {
-					info.IMDBID = val
-				}
+	tmdbID, imdbID := strings.TrimSpace(doc.TMDBID), strings.TrimSpace(doc.IMDBID)
+	for _, uid := range doc.UniqueIDs {
+		val := strings.TrimSpace(uid.Value)
+		switch strings.ToLower(uid.Type) {
+		case "tmdb":
+			if tmdbID == "" {
+				tmdbID = val
+			}
+		case "imdb":
+			if imdbID == "" {
+				imdbID = val
 			}
 		}
+	}
+	// For episodes, TMDBID/IMDBID are reserved for the series.
+	if isEpisodeDoc {
+		info.EpisodeTMDBID, info.EpisodeIMDBID = tmdbID, imdbID
+	} else {
+		info.TMDBID, info.IMDBID = tmdbID, imdbID
 	}
 	return info, true
 }

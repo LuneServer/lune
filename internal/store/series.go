@@ -289,7 +289,7 @@ func (s *Store) ListSeriesEpisodes(ctx context.Context, libraryID, seriesTitle, 
 			&m.PosterPath, &m.BackdropPath,
 			&m.Overview, &m.Tagline, &m.Rating, &m.GenresJSON,
 			&m.ContentRating, &m.ReleaseDate, &m.DirectorsJSON, &m.WritersJSON, &m.StudiosJSON, &m.CastJSON,
-			&m.TMDBID, &m.IMDBID, &m.MetadataVersion,
+			&m.TMDBID, &m.IMDBID, &m.EpisodeTMDBID, &m.EpisodeIMDBID, &m.MetadataVersion,
 			&probedStr, &createdStr, &updatedStr,
 			&posMS, &durMS, &completed, &playCount, &lastPlayed,
 		); err != nil {

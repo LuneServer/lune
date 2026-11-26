@@ -55,7 +55,7 @@ const (
 	// CurrentMetadataVersion is bumped whenever new descriptive metadata fields are added to the
 	// scanner/enricher (e.g. credits, cast, content rating, release date, IMDb IDs) so incremental
 	// scans and startup backfill automatically upgrade previously indexed items.
-	CurrentMetadataVersion = 1
+	CurrentMetadataVersion = 2
 )
 
 // Service coordinates media library configuration, incremental scanning, and catalog queries.
@@ -597,6 +597,9 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 		item.Rating = nfo.Rating
 		item.ContentRating = nfo.ContentRating
 		item.ReleaseDate = nfo.ReleaseDate
+		if item.Kind == "episode" {
+			item.EpisodeTMDBID, item.EpisodeIMDBID = nfo.EpisodeTMDBID, nfo.EpisodeIMDBID
+		}
 		if item.TMDBID == "" && nfo.TMDBID != "" {
 			item.TMDBID = nfo.TMDBID
 		}
@@ -630,9 +633,9 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 		}
 	}
 
-	// Preserve an existing TMDB ID (e.g. from a manual admin Identify/Re-Match) across re-scans
-	// unless the path or local .nfo supplied an explicit external ID (TMDB or IMDb).
-	if item.TMDBID == "" && item.IMDBID == "" && job.existingTMDBID != "" {
+	// Preserve an existing TMDB binding unless the path or NFO supplies a TMDB ID.
+	// An IMDb ID alone cannot select a match in the lookups below.
+	if item.TMDBID == "" {
 		item.TMDBID = job.existingTMDBID
 	}
 
@@ -667,6 +670,7 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 				if item.AbsoluteEpisodeNumber != nil {
 					absEp = *item.AbsoluteEpisodeNumber
 				}
+				// For episodes, the path, series NFO, and retained binding supply the series ID.
 				if item.TMDBID != "" && hasSearch {
 					remote, err = searchEnricher.EnrichEpisodeByTMDBID(ctx, item.ID, item.TMDBID, season, episode, absEp, lib.Kind == "anime")
 				} else if lib.Kind == "anime" && hasAnime {

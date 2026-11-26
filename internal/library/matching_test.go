@@ -97,6 +97,9 @@ func TestScanner_DirectIDLookupAndPinnedTMDBSurvival(t *testing.T) {
 	_ = os.MkdirAll(seasonDir, 0o755)
 	_ = os.WriteFile(filepath.Join(showDir, "tvshow.nfo"), []byte(`<tvshow><title>The Expanse</title><uniqueid type="tmdb">63639</uniqueid></tvshow>`), 0o644)
 	_ = os.WriteFile(filepath.Join(seasonDir, "The Expanse - S01E01.mkv"), []byte("video"), 0o644)
+	if err := os.WriteFile(filepath.Join(seasonDir, "The Expanse - S01E01.nfo"), []byte(`<episodedetails><tmdbid>123456</tmdbid><uniqueid type="imdb">tt1234567</uniqueid></episodedetails>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	enricher := &stubMatchingEnricher{}
 	svc := NewService(db, noopMatchProber{}, nil)
@@ -126,6 +129,14 @@ func TestScanner_DirectIDLookupAndPinnedTMDBSurvival(t *testing.T) {
 	}
 	if len(enricher.byIDEpCalls) != 1 || enricher.byIDEpCalls[0] != "63639" || enricher.searchEpCalls != 0 {
 		t.Fatalf("expected direct EnrichEpisodeByTMDBID(63639) from parent tvshow.nfo, got byID=%+v search=%d", enricher.byIDEpCalls, enricher.searchEpCalls)
+	}
+
+	episodes, _, err := svc.ListItems(ctx, store.MediaListFilter{LibraryID: showsLib.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(episodes) != 1 || episodes[0].TMDBID != "63639" || episodes[0].EpisodeTMDBID != "123456" || episodes[0].EpisodeIMDBID != "tt1234567" {
+		t.Fatalf("expected separate persisted series and episode IDs, got %+v", episodes)
 	}
 
 	// Manually re-match "Arrival" to TMDB ID 329865, then force re-scan the library.
@@ -169,9 +180,11 @@ func TestScanner_DirectIDLookupAndPinnedTMDBSurvival(t *testing.T) {
 		t.Fatalf("expected 0 title-search calls on force re-scan of already-matched items, got %d", enricher.searchMovieCalls)
 	}
 
-	// If an explicit local .nfo supplies an IMDb ID without a TMDB ID, do NOT restore the old retained TMDB ID.
+	// An IMDb-only NFO must not replace a pinned match with title search.
 	nfoPath := filepath.Join(moviesRoot, "Arrival (2016).nfo")
-	_ = os.WriteFile(nfoPath, []byte(`<movie><title>Arrival</title><uniqueid type="imdb">tt2543164</uniqueid></movie>`), 0o644)
+	if err := os.WriteFile(nfoPath, []byte(`<movie><title>Arrival</title><uniqueid type="imdb">tt2543164</uniqueid></movie>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	enricher.mu.Lock()
 	enricher.searchMovieCalls = 0
 	enricher.byIDMovieCalls = nil
@@ -184,7 +197,10 @@ func TestScanner_DirectIDLookupAndPinnedTMDBSurvival(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetItem after imdb nfo: %v", err)
 	}
-	if afterIMDB.IMDBID != "tt2543164" || afterIMDB.TMDBID == "329865" {
-		t.Fatalf("expected imdb-only nfo not to restore stale TMDB ID 329865, got tmdb=%q imdb=%q", afterIMDB.TMDBID, afterIMDB.IMDBID)
+	if afterIMDB.IMDBID != "tt2543164" || afterIMDB.TMDBID != "329865" {
+		t.Fatalf("expected IMDb-only NFO to preserve pinned TMDB ID 329865, got tmdb=%q imdb=%q", afterIMDB.TMDBID, afterIMDB.IMDBID)
+	}
+	if enricher.searchMovieCalls != 0 || afterIMDB.Overview != "matched directly by id 329865" {
+		t.Fatalf("expected direct lookup of retained binding, got %q and %d title searches", afterIMDB.Overview, enricher.searchMovieCalls)
 	}
 }
