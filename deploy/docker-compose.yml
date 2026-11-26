@@ -12,6 +12,10 @@ services:
       # Or LAN / reverse-proxy / Tailscale mode (LUNE_EDGE_MODE=local|proxy|tailscale):
       # - "5863:5863"
     environment:
+      # File ownership inside /data & /media (defaults to 1000:1000; use 99:100 on Unraid)
+      PUID: 1000
+      PGID: 1000
+      UMASK: "002"
       # Access mode: local | acme | proxy | tailscale
       LUNE_EDGE_MODE: acme
       LUNE_DOMAIN: lune.example.com
@@ -27,11 +31,14 @@ services:
       # Optional: override TMDB key or proxy URL
       # LUNE_TMDB_API_KEY: your-tmdb-v3-api-key
       # LUNE_TMDB_BASE_URL: https://tmdb.example.com
+      # Optional: hardware transcoding overrides (auto-probed by default when /dev/dri is passed through)
+      # LUNE_HW_ACCEL: auto        # auto | vaapi | qsv | nvenc | software
+      # LUNE_VAAPI_DEVICE: /dev/dri/renderD128
       LUNE_DATA_DIR: /data
       LUNE_MEDIA_DIR: /media
     volumes:
       - ./data:/data
       - /path/to/media:/media:ro
-    # Optional: pass through Intel QuickSync / VAAPI GPU for hardware transcoding
+    # Optional: pass through Intel QuickSync / AMD VA-API GPU for hardware transcoding
     # devices:
     #   - /dev/dri:/dev/dri

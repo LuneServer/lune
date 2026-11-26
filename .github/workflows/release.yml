@@ -169,7 +169,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ needs.validate.outputs.version }}
+            VERSION=${{ needs.validate.outputs.clean_version }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ needs.validate.outputs.build_date }}
           secrets: |

@@ -18,6 +18,7 @@ type SeriesSummary struct {
 	ContentRating        string
 	GenresJSON           string
 	Overview             string
+	VideoWidth           int
 	VideoHeight          int
 	VideoHDR             string
 	SeasonCount          int
@@ -130,11 +131,11 @@ func (s *Store) ListSeriesFiltered(ctx context.Context, f SeriesListFilter) ([]S
 	}
 	switch strings.ToLower(strings.TrimSpace(f.Resolution)) {
 	case "4k":
-		having = append(having, "MAX(m.video_height) >= 2000")
+		having = append(having, "(MAX(m.video_width) >= 3200 OR MAX(m.video_height) >= 2000)")
 	case "1080p":
-		having = append(having, "MAX(m.video_height) >= 1000 AND MAX(m.video_height) < 2000")
+		having = append(having, "NOT (MAX(m.video_width) >= 3200 OR MAX(m.video_height) >= 2000) AND (MAX(m.video_width) >= 1800 OR MAX(m.video_height) >= 1000)")
 	case "720p":
-		having = append(having, "MAX(m.video_height) >= 700 AND MAX(m.video_height) < 1000")
+		having = append(having, "NOT (MAX(m.video_width) >= 3200 OR MAX(m.video_height) >= 2000) AND NOT (MAX(m.video_width) >= 1800 OR MAX(m.video_height) >= 1000) AND (MAX(m.video_width) >= 1200 OR MAX(m.video_height) >= 700)")
 	}
 	if f.HDR {
 		having = append(having, "MAX(CASE WHEN m.video_hdr != '' AND lower(m.video_hdr) != 'sdr' THEN 1 ELSE 0 END) = 1")
@@ -181,6 +182,7 @@ func (s *Store) ListSeriesFiltered(ctx context.Context, f SeriesListFilter) ([]S
 			MAX(m.content_rating) AS content_rating,
 			MAX(m.genres_json) AS genres_json,
 			MAX(m.overview) AS overview,
+			MAX(m.video_width) AS max_width,
 			MAX(m.video_height) AS max_height,
 			MAX(CASE WHEN m.video_hdr != '' AND lower(m.video_hdr) != 'sdr' THEN m.video_hdr ELSE '' END) AS video_hdr,
 			COUNT(DISTINCT COALESCE(m.season_number, 1)) AS season_count,
@@ -217,7 +219,7 @@ func (s *Store) ListSeriesFiltered(ctx context.Context, f SeriesListFilter) ([]S
 		var latestStr string
 		if err := rows.Scan(
 			&ss.LibraryID, &ss.LibraryKind, &ss.Title, &ss.OriginalTitle, &minYear,
-			&ss.Rating, &ss.ContentRating, &ss.GenresJSON, &ss.Overview, &ss.VideoHeight, &ss.VideoHDR,
+			&ss.Rating, &ss.ContentRating, &ss.GenresJSON, &ss.Overview, &ss.VideoWidth, &ss.VideoHeight, &ss.VideoHDR,
 			&ss.SeasonCount, &ss.EpisodeCount, &ss.RepresentativeItemID,
 			&hasPoster, &hasBackdrop, &dualAudio, &latestStr,
 		); err != nil {

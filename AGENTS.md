@@ -2,7 +2,9 @@
 
 This document describes the architecture, conventions, and engineering invariants of **Lune Server** (`github.com/LuneServer/lune`) and how it fits into the wider Lune platform.
 
-> **Mandatory Maintenance Rule:** Whenever you implement new functionality or change existing architecture (packages, HTTP endpoints, SQLite migrations, environment variables, streaming behavior, deployment manifests, or cross-repo contracts), **you must update this `AGENTS.md` in the same change**. If the change alters platform-level architecture, also update [`docs/architecture.md`](docs/architecture.md), and if it changes API contracts or static asset expectations consumed by the web client, update `lune-web/AGENTS.md` accordingly.
+> **Mandatory Branch Workflow:** Never commit directly to `main` or pile unrelated changes onto an existing branch. Start every distinct task (feature, fix, or doc change) on its own branch from an up-to-date local `main` (fetch and fast-forward `main` first, then `git switch -c <type>/<short-topic> main`, e.g. `fix/unraid-permissions`; if local `main` cannot fast-forward to `origin/main` or has commits not on `origin/main`, use the freshly fetched `origin/main` as the start point instead). For parallel or concurrent work, or when the working tree already holds uncommitted changes from another task, use a separate worktree (`git worktree add ../lune-worktrees/<topic>/lune -b <type>/<topic> main`, substituting the freshly fetched `origin/main` as the base under the same fallback) instead of switching branches in place; for cross-repo tasks put all three worktrees under the same `../lune-worktrees/<topic>/` parent (`lune`, `lune-web`, `lune-brand`) so the `../lune-web`/`../lune-brand` paths below resolve to the task branches. Keep each branch scoped to one concern, run `git status` before editing to confirm what you're building on, and when a task spans repos (`lune`, `lune-web`, `lune-brand`), use a same-named branch in each. Do not merge, rebase onto, or push unless the user asks.
+
+> **Mandatory Maintenance Rule:** Whenever you implement new functionality or change existing architecture (packages, HTTP endpoints, SQLite migrations, environment variables, streaming behavior, deployment manifests, or cross-repo contracts), **you must update this `AGENTS.md` in the same change**. If it changes API contracts or static asset expectations consumed by the web client, update `lune-web/AGENTS.md` accordingly.
 
 ---
 
@@ -84,9 +86,8 @@ lune/
 │   ├── web/                     # Static SPA handler (NewSPAHandler) for built lune-web/dist
 │   └── version/                 # Build-time Version, Commit, BuildDate (set via -ldflags)
 ├── deploy/
-│   ├── docker-compose.yml       # Single-container deployment (ports 80/443, /data, /media:ro, optional /dev/dri)
-│   └── unraid/lune.xml          # Unraid Community Applications template
-├── docs/architecture.md         # Platform v1 blueprint & milestone roadmap
+│   ├── docker-compose.yml       # Single-container deployment (PUID/PGID/UMASK, ports 80/443 or 5863, /data, /media:ro, optional /dev/dri)
+│   └── docker-entrypoint.sh     # PUID/PGID/UMASK privilege-drop entrypoint (gosu, /data ownership sync, /dev/dri group setup, non-root --user passthrough)
 ├── .github/workflows/           # ci.yml (vet, race test, static build) & release.yml (validated workflow_dispatch release, GitHub Release & multi-arch GHCR)
 └── Dockerfile                   # Multi-stage static Go build + Debian bookworm-slim + FFmpeg runtime
 ```
@@ -119,6 +120,8 @@ All configuration is environment-driven:
 | `LUNE_SONARR_URL` | *(empty)* | Optional env override for primary Sonarr v3 base URL |
 | `LUNE_SONARR_API_KEY` | *(empty)* | Optional env override for primary Sonarr v3 API key |
 | `LUNE_SCAN_INTERVAL` | `30m` | Periodic fallback library scan interval (`0` disables periodic scans) |
+| `LUNE_HW_ACCEL` | `auto` | Hardware transcoding backend override: `auto` (probed & verified at startup), `vaapi`, `qsv`, `nvenc`, `videotoolbox`, or `software` |
+| `LUNE_VAAPI_DEVICE` | *(auto)* | Optional explicit DRM render node (e.g. `/dev/dri/renderD128` or `/dev/dri/renderD129`); auto-scans `/dev/dri/renderD*` when unset |
 | `LUNE_TRUSTED_PROXIES` | *(empty)* | Comma-separated IPs/CIDRs allowed to supply `X-Forwarded-For` |
 | `LUNE_ADMIN_LAN_ONLY` | `false` | Restrict `/api/v1/admin/*` to loopback, RFC1918 LAN, Tailscale CGNAT (`100.64.0.0/10`), or `LUNE_IP_ALLOWLIST` |
 | `LUNE_IP_ALLOWLIST` | *(empty)* | Comma-separated IPs/CIDRs exempt from edge rate limits/auto-bans and permitted under `LUNE_ADMIN_LAN_ONLY` |
@@ -149,7 +152,7 @@ All configuration is environment-driven:
 - Brute-force protection uses `AuthRateLimiter` (5 failures / 10m -> progressive lockout 30s..15m), returning HTTP `429` with `Retry-After`, and feeds lockouts into `security.EdgeGuard` (sharded per-IP rate limiter + auto-ban on repeated auth lockouts, forged `/stream/*` tokens, or unauthenticated API probing; managed via `/api/v1/admin/security/bans`). Invite inspection/acceptance is also rate-limited per IP.
 - Pure-Go RFC 6238 TOTP two-factor authentication (`/api/v1/users/me/totp/{setup,enable,disable}` and `/api/v1/admin/users/{id}/totp` reset) issues 8 SHA-256-hashed one-time recovery codes; `POST /api/v1/auth/login` signals `X-Lune-TOTP-Required: true` when a TOTP-enabled account omits `totp_code`.
 - Invite tokens are 256-bit random values stored only as SHA-256 hashes in `user_invites`; raw tokens are returned once at creation. Invite acceptance atomically validates expiry/revocation/use limits, creates the account with library grants, and increments `use_count`.
-- **Per-user library ACLs:** Admins and users with `all_libraries=1` have unrestricted access. Restricted members (`all_libraries=0`) are constrained to `user_library_access` rows across libraries, items, artwork, series, playback negotiation, watch progress, Continue Watching, Next Up (`GET /api/v1/playback/next-up`), and watchlist/favorites. `UserPreferences` includes `combine_next_up` (defaults to `true`) for combining Next Up into Continue Watching on clients.
+- **Per-user library ACLs:** Admins and users with `all_libraries=1` have unrestricted access. Restricted members (`all_libraries=0`) are constrained to `user_library_access` rows across libraries, items, artwork, series, playback negotiation, watch progress, Continue Watching, Next Up (`GET /api/v1/playback/next-up`), and watchlist/favorites. `UserPreferences` includes `combine_next_up` (defaults to `true`) for combining Next Up into Continue Watching on clients and `poster_badges` (defaults to empty / none; validated values: `resolution`, `hdr`, `dual_audio`, `seasons`, `rating`) for configurable poster overlay badges.
 - User avatars (PNG/JPEG/WebP, max 2 MiB, sniffed via `http.DetectContentType`) are stored under `<DataDir>/avatars/` and cleaned up on avatar deletion or user removal.
 - Security-relevant events (login, lockout, password changes, user admin actions, invite lifecycle, session revocation, device approvals) are recorded in `audit_events`.
 
@@ -182,12 +185,13 @@ go run ./cmd/lune
 LUNE_WEB_DIR=../lune-web/dist go run ./cmd/lune
 ```
 
+Release builds inject the tag **without** its leading `v` (tag `v0.1.0-beta.1` -> `version.Version = "0.1.0-beta.1"`) so API/CLI versions stay plain SemVer; clients add the `v` prefix for display.
+
 ---
 
 ## 7. Keeping Documentation Up to Date
 
 When implementing new functionality in `lune`, check and update:
 1. **This file (`AGENTS.md`):** Update the package layout, environment variable table, invariants, or verification commands whenever they change.
-2. **`docs/architecture.md`:** Keep the high-level blueprint and milestone progress aligned with significant architectural additions.
-3. **`deploy/docker-compose.yml` & `deploy/unraid/lune.xml`:** Add any new user-facing `LUNE_*` environment variables or volume/device requirements.
-4. **Cross-repo impact:** If you add or modify `/api/v1/*` routes or DTO fields, note or apply matching updates in `../lune-web/src/lib/api.ts` and `../lune-web/AGENTS.md`.
+2. **`deploy/docker-compose.yml` (and `LuneServer/unraid-templates`):** Add any new user-facing `LUNE_*` environment variables or volume/device requirements.
+3. **Cross-repo impact:** If you add or modify `/api/v1/*` routes or DTO fields, note or apply matching updates in `../lune-web/src/lib/api.ts` and `../lune-web/AGENTS.md`. Make those edits on the same-named branch in `../lune-web` (or in the matching worktree when that checkout has uncommitted changes from another task), never on whatever branch happens to be checked out there.

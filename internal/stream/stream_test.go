@@ -183,6 +183,49 @@ func TestEvaluatePlayback_4KRemux_10BitAnime_HDR_And_BurnIn(t *testing.T) {
 		t.Fatalf("expected transcode for Dolby Vision on non-DoVi client, got %+v", d)
 	}
 
+	// 4b. Dolby Vision Profile 8 (dovi_hdr10) on HDR10-capable non-DoVi client -> zero-transcode remux to HDR10 hvc1!
+	doviP8Item := store.MediaItem{
+		Container:   "mkv",
+		VideoCodec:  "hevc",
+		VideoWidth:  3840,
+		VideoHeight: 2160,
+		VideoHDR:    "dovi_hdr10",
+		AudioCodec:  "eac3",
+	}
+	doviP8Streams := []metadata.StreamInfo{
+		{Index: 0, Type: "video", Codec: "hevc", Profile: "Main 10", PixFmt: "yuv420p10le", HDR: "dovi_hdr10", DVProfile: 8, DVCompatID: 1},
+	}
+	d = evaluatePlayback(doviP8Item, doviP8Streams, nil, ClientCapabilities{
+		Containers:        []string{"mp4"},
+		VideoCodecs:       []string{"hevc"},
+		AudioCodecs:       []string{"aac", "eac3"},
+		Supports10BitHEVC: boolPtr(true),
+		SupportsHDR:       boolPtr(true),
+		SupportsDoVi:      boolPtr(false),
+	}, true)
+	if d.mode != "remux" || !d.videoCopy {
+		t.Fatalf("expected remux (video copy) for Dolby Vision Profile 8 on HDR10-capable client, got %+v", d)
+	}
+
+	// 4c. MP4 with HEVC hev1 tag -> forces remux (-tag:v hvc1) instead of Direct Play.
+	hev1MP4 := store.MediaItem{
+		Container:  "mp4",
+		VideoCodec: "hevc",
+		AudioCodec: "aac",
+	}
+	hev1Streams := []metadata.StreamInfo{
+		{Index: 0, Type: "video", Codec: "hevc", Profile: "Main 10", PixFmt: "yuv420p10le", CodecTag: "hev1"},
+	}
+	d = evaluatePlayback(hev1MP4, hev1Streams, nil, ClientCapabilities{
+		Containers:        []string{"mp4"},
+		VideoCodecs:       []string{"hevc"},
+		AudioCodecs:       []string{"aac"},
+		Supports10BitHEVC: boolPtr(true),
+	}, true)
+	if d.mode != "remux" || !d.videoCopy || !d.audioCopy {
+		t.Fatalf("expected zero-transcode remux for hev1-tagged HEVC MP4, got %+v", d)
+	}
+
 	// 5. Bitmap PGS subtitle burn-in forces transcode even for Direct Playable H.264 MP4.
 	mp4Item := store.MediaItem{
 		Container:  "mp4",
@@ -222,7 +265,7 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 		hasZscaleTonemap: true,
 	}
 
-	// 4K HEVC MKV remux with audio copy -> fMP4 + hvc1 tag + -c:v copy + -c:a copy + -sn -dn.
+	// 4K HEVC MKV remux with audio copy -> fMP4 + hvc1 tag + -noaccurate_seek -ss + -c:v copy + -c:a copy + -sn -dn.
 	remuxArgs := strings.Join(tr.buildFFmpegArgs("/media/4k.mkv", "/tmp/out", TranscodeOptions{
 		Mode:            "remux",
 		VideoCodec:      "hevc",
@@ -230,7 +273,7 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 		StartPositionMS: 120_000,
 	}), " ")
 	for _, want := range []string{
-		"-ss 120.000",
+		"-noaccurate_seek -ss 120.000",
 		"-c:v copy",
 		"-tag:v hvc1",
 		"-c:a copy",
@@ -245,7 +288,21 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 		}
 	}
 
-	// HDR10 transcode with PGS burn-in -> tone-map + overlay + yuv420p + libx264 + keyframe alignment.
+	// Remux with audio transcode must omit first_pts=0 so A/V stay locked with -avoid_negative_ts make_zero.
+	remuxAACArgs := strings.Join(tr.buildFFmpegArgs("/media/4k.mkv", "/tmp/out", TranscodeOptions{
+		Mode:            "remux",
+		VideoCodec:      "hevc",
+		AudioCopy:       false,
+		StartPositionMS: 600_000,
+	}), " ")
+	if !strings.Contains(remuxAACArgs, "-noaccurate_seek -ss 600.000") {
+		t.Fatalf("expected remux AAC args to use -noaccurate_seek -ss 600.000, got: %s", remuxAACArgs)
+	}
+	if !strings.Contains(remuxAACArgs, "-af aresample=async=1 ") || strings.Contains(remuxAACArgs, "first_pts=0") {
+		t.Fatalf("expected remux AAC args to use aresample=async=1 without first_pts=0, got: %s", remuxAACArgs)
+	}
+
+	// HDR10 transcode with PGS burn-in -> tone-map + scale2ref + overlay + yuv420p + BT.709 color tags + libx264 + keyframe alignment.
 	burnArgs := strings.Join(tr.buildFFmpegArgs("/media/4k.mkv", "/tmp/out", TranscodeOptions{
 		Mode:                  "transcode",
 		VideoCodec:            "hevc",
@@ -255,17 +312,85 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 		BurnSubtitleStreamIdx: intPtr(3),
 	}), " ")
 	for _, want := range []string{
+		"-fflags +genpts",
 		"-filter_complex",
 		"tonemap=tonemap=hable:desat=0",
-		"[0:3]overlay=eof_action=pass",
+		"[0:3][vpre]scale2ref[sub_scaled][vbase];[vbase][sub_scaled]overlay=eof_action=pass",
+		"setsar=1",
 		"format=yuv420p",
 		"-c:v libx264",
 		"-profile:v high",
 		"-maxrate 10000k",
+		"-color_primaries bt709",
+		"-color_trc bt709",
+		"-colorspace bt709",
+		"-color_range tv",
 		"-c:a aac",
 	} {
 		if !strings.Contains(burnArgs, want) {
 			t.Fatalf("expected burn-in transcode args to contain %q, got: %s", want, burnArgs)
+		}
+	}
+
+	// HDR10 transcode without zscale/libplacebo falls back to BT.2020->BT.709 matrix conversion + BT.709 SDR tags.
+	trNoZscale := &Transcoder{ffmpegBin: "/usr/bin/ffmpeg", hwAccel: HWAccelNone}
+	fallbackHDRArgs := strings.Join(trNoZscale.buildFFmpegArgs("/media/4k.mkv", "/tmp/out", TranscodeOptions{
+		Mode:       "transcode",
+		VideoCodec: "hevc",
+		VideoHDR:   "hdr10",
+	}), " ")
+	for _, want := range []string{
+		"scale=in_color_matrix=bt2020:out_color_matrix=bt709",
+		"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
+		"-color_primaries bt709",
+		"-color_trc bt709",
+		"-colorspace bt709",
+	} {
+		if !strings.Contains(fallbackHDRArgs, want) {
+			t.Fatalf("expected fallback HDR args to contain %q, got: %s", want, fallbackHDRArgs)
+		}
+	}
+
+	// VA-API full GPU decode + scale_vaapi/tonemap_vaapi pipeline on custom render node.
+	trVAAPI := &Transcoder{
+		ffmpegBin:       "/usr/bin/ffmpeg",
+		hwAccel:         HWAccelVAAPI,
+		vaapiDevice:     "/dev/dri/renderD129",
+		hasTonemapVAAPI: true,
+		hasScaleVAAPI:   true,
+	}
+	vaapiHDRArgs := strings.Join(trVAAPI.buildFFmpegArgs("/media/4k.mkv", "/tmp/out", TranscodeOptions{
+		Mode:         "transcode",
+		VideoCodec:   "hevc",
+		VideoHDR:     "hdr10",
+		SourceHeight: 2160,
+		MaxHeight:    1080,
+	}), " ")
+	for _, want := range []string{
+		"-hwaccel vaapi",
+		"-hwaccel_device /dev/dri/renderD129",
+		"-hwaccel_output_format vaapi",
+		"tonemap_vaapi=format=nv12:matrix=bt709:primaries=bt709:transfer=bt709,scale_vaapi=w=-2:h=1080",
+		"-c:v h264_vaapi",
+	} {
+		if !strings.Contains(vaapiHDRArgs, want) {
+			t.Fatalf("expected VAAPI HDR args to contain %q, got: %s", want, vaapiHDRArgs)
+		}
+	}
+
+	// 10-bit H.264 (Hi10P) cannot be HW-decoded on VA-API -> must use CPU decode + format=nv12,hwupload + h264_vaapi.
+	vaapiHi10PArgs := strings.Join(trVAAPI.buildFFmpegArgs("/media/anime.mkv", "/tmp/out", TranscodeOptions{
+		Mode:         "transcode",
+		VideoCodec:   "h264",
+		VideoProfile: "High 10",
+		VideoPixFmt:  "yuv420p10le",
+	}), " ")
+	if strings.Contains(vaapiHi10PArgs, "-hwaccel vaapi") {
+		t.Fatalf("expected 10-bit H.264 not to use VA-API HW decode, got: %s", vaapiHi10PArgs)
+	}
+	for _, want := range []string{"-vaapi_device /dev/dri/renderD129", "format=nv12,hwupload", "-c:v h264_vaapi"} {
+		if !strings.Contains(vaapiHi10PArgs, want) {
+			t.Fatalf("expected VAAPI Hi10P args to contain %q, got: %s", want, vaapiHi10PArgs)
 		}
 	}
 
@@ -332,5 +457,38 @@ func TestBuildSubtitleCatalog_IncludesBitmapBurnInAndDoesNotAutoSelect(t *testin
 	pgsOnly := []SubtitleStreamDTO{subs[0]}
 	if sel := selectPreferredSubtitle(pgsOnly, "ja", store.UserPreferences{SubtitlesEnabled: true}, true); sel != nil {
 		t.Fatalf("expected burn-in PGS track not to be auto-selected, got %v", *sel)
+	}
+}
+
+func TestParseFrameCRCStartMS(t *testing.T) {
+	// Standard 1/1000 MKV with B-frames (DTS < PTS): returns DTS so offset + video.currentTime == exact PTS.
+	mkvOut := strings.Join([]string{
+		"#extradata 0:      152, 0x56812563",
+		"#tb 0: 1/1000",
+		"#media_type 0: video",
+		"0,     598875,     599042,       42,   272191, 0xbf323b9a",
+	}, "\n")
+	got, ok := parseFrameCRCStartMS(mkvOut)
+	if !ok || got != 598875 {
+		t.Fatalf("expected 598875, got %d (ok=%v)", got, ok)
+	}
+
+	// Non-millisecond timebase (1/90000 MPEG-TS): 54,000,000 ticks == 600,000ms.
+	tsOut := "#tb 0: 1/90000\n0,   54000000,   54007500,     3750,   123456, 0xdeadbeef\n"
+	got, ok = parseFrameCRCStartMS(tsOut)
+	if !ok || got != 600000 {
+		t.Fatalf("expected 600000, got %d (ok=%v)", got, ok)
+	}
+
+	// Missing/negative DTS falls back to PTS.
+	ptsFallback := "#tb 0: 1/1000\n0,       -167,      10000,       42,    12345, 0x12345678\n"
+	got, ok = parseFrameCRCStartMS(ptsFallback)
+	if !ok || got != 10000 {
+		t.Fatalf("expected 10000 fallback to PTS, got %d (ok=%v)", got, ok)
+	}
+
+	// Empty output returns false.
+	if _, ok := parseFrameCRCStartMS(""); ok {
+		t.Fatalf("expected ok=false for empty framecrc output")
 	}
 }

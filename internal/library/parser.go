@@ -29,7 +29,8 @@ var (
 	rePathIMDBID     = regexp.MustCompile(`(?i)[\{\[\(]\s*(?:imdb(?:id)?[-=:\s]+)?(tt\d{6,10})\s*[\}\]\)]`)
 	reParensMeta     = regexp.MustCompile(`(?i)\([^)]*(?:2160p|1080p|720p|480p|bd|blu-?ray|web-?dl|webrip|hevc|x265|x264|av1|10bit|hi10p|flac|aac|opus|dual[\s._-]?audio|multi[\s._-]?sub|\d{3,4}x\d{3,4}|[0-9a-f]{8})[^)]*\)`)
 	reSpaces          = regexp.MustCompile(`\s+`)
-	reLeadingGroup    = regexp.MustCompile(`^\s*\[([^\]]{1,40})\]`)
+	reLeadingGroup        = regexp.MustCompile(`^\s*\[([^\]]{1,40})\]`)
+	reBracketReleaseGroup = regexp.MustCompile(`\]-([A-Za-z0-9][A-Za-z0-9._-]{0,24})\s*$`)
 	reAnimeDashEp     = regexp.MustCompile(`(?i)^(.+?)\s+[-–—]\s+(\d{1,4})(?:v\d+)?(?:\s+[-–—]\s+(.+?))?(?:\s*$|\s+[\(\[])`)
 	reAnimeEpWord     = regexp.MustCompile(`(?i)^(.+?)\s+(?:episode|ep\.?)\s*(\d{1,4})(?:v\d+)?(?:\s+[-–—:]?\s*(.+?))?$`)
 	reLeadingEpNum    = regexp.MustCompile(`(?i)^(\d{1,4})(?:v\d+)?(?:\s*[-–—.]\s*(.+?))?$`)
@@ -144,7 +145,12 @@ func parseEpisode(rootPath, fullPath, base string) ParsedFile {
 		if e, err := strconv.Atoi(base[m[4]:m[5]]); err == nil {
 			out.EpisodeNumber = &e
 		}
-		prefix := cleanTitle(base[:m[0]])
+		rawPrefix := stripAnimeMeta(base[:m[0]])
+		if _, _, y, ok := findReleaseYear(rawPrefix); ok {
+			out.Year = &y
+			rawPrefix = stripYearFromTitle(rawPrefix)
+		}
+		prefix := cleanTitle(rawPrefix)
 		suffix := cleanTitle(reQualityTail.ReplaceAllString(stripAnimeMeta(base[m[1]:]), ""))
 		if prefix != "" {
 			out.SeriesTitle = prefix
@@ -155,11 +161,11 @@ func parseEpisode(rootPath, fullPath, base string) ParsedFile {
 			out.Title = strings.ToUpper(base[m[0]:m[1]])
 		}
 	} else {
-		out.Title = cleanTitle(base)
+		out.Title = cleanTitle(stripAnimeMeta(base))
 	}
 
-	// Infer series title from directory hierarchy when missing from filename.
-	if out.SeriesTitle == "" {
+	// Infer series title and/or release year from directory hierarchy when missing from filename.
+	if out.SeriesTitle == "" || out.Year == nil {
 		inferSeriesFromDirs(rootPath, fullPath, &out)
 	}
 
@@ -521,27 +527,31 @@ func inferSeriesFromDirs(rootPath, fullPath string, out *ParsedFile) {
 	if len(parts) > 0 && parts[0] != "" {
 		series := stripExternalIDTags(parts[0])
 		if start, _, y, ok := findReleaseYear(series); ok {
-			out.Year = &y
+			if out.Year == nil {
+				out.Year = &y
+			}
 			series = series[:start]
 		}
-		out.SeriesTitle = cleanTitle(series)
+		if out.SeriesTitle == "" {
+			out.SeriesTitle = cleanTitle(series)
+		}
 	}
 }
 
 func extractReleaseGroup(base string) string {
-	m := reLeadingGroup.FindStringSubmatch(base)
-	if len(m) < 2 {
-		return ""
+	if m := reLeadingGroup.FindStringSubmatch(base); len(m) >= 2 {
+		cand := strings.TrimSpace(m[1])
+		if cand != "" && !reTechBracketTag.MatchString(cand) {
+			bracketed := "[" + cand + "]"
+			if !rePathTMDBID.MatchString(bracketed) && !rePathIMDBID.MatchString(bracketed) {
+				return cand
+			}
+		}
 	}
-	cand := strings.TrimSpace(m[1])
-	if cand == "" || reTechBracketTag.MatchString(cand) {
-		return ""
+	if m := reBracketReleaseGroup.FindStringSubmatch(base); len(m) >= 2 {
+		return strings.TrimSpace(m[1])
 	}
-	bracketed := "[" + cand + "]"
-	if rePathTMDBID.MatchString(bracketed) || rePathIMDBID.MatchString(bracketed) {
-		return ""
-	}
-	return cand
+	return ""
 }
 
 // extractPathExternalIDs checks the filename and its folder for provider tags.
@@ -585,6 +595,7 @@ func stripExternalIDTags(raw string) string {
 
 func stripAnimeMeta(raw string) string {
 	s := stripExternalIDTags(raw)
+	s = reBracketReleaseGroup.ReplaceAllString(s, "]")
 	s = reCurlyTags.ReplaceAllString(s, " ")
 	s = reBrackets.ReplaceAllString(s, " ")
 	s = reParensMeta.ReplaceAllString(s, " ")

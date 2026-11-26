@@ -52,10 +52,10 @@ type ScanError struct {
 
 const (
 	maxScanErrorSamples = 10
-	// CurrentMetadataVersion is bumped whenever new descriptive metadata fields are added to the
-	// scanner/enricher (e.g. credits, cast, content rating, release date, IMDb IDs) so incremental
-	// scans and startup backfill automatically upgrade previously indexed items.
-	CurrentMetadataVersion = 2
+	// CurrentMetadataVersion is bumped whenever parser, scanner, or enricher logic changes
+	// (e.g. credits, cast, content rating, release date, IMDb IDs, or Sonarr/TV year & group parsing)
+	// so incremental scans and startup backfill automatically upgrade previously indexed items.
+	CurrentMetadataVersion = 3
 )
 
 // Service coordinates media library configuration, incremental scanning, and catalog queries.

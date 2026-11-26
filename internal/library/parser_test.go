@@ -46,6 +46,28 @@ func TestParseMediaPath_MovieAndEpisode(t *testing.T) {
 	if ep.PosterPath != seriesPoster {
 		t.Fatalf("expected inherited series poster %s, got %s", seriesPoster, ep.PosterPath)
 	}
+	if ep.Year == nil || *ep.Year != 2015 {
+		t.Fatalf("expected inherited series year 2015, got %v", ep.Year)
+	}
+
+	// TV show whose title is itself a year with (YYYY) and [tags]-Group suffix
+	epYearTitle := ParseMediaPath(
+		showRoot,
+		filepath.Join(showRoot, "1905 (2021)", "Season 01", "1905 (2021) - S01E02 - Beyond the Ridge [WEBDL-1080p][EAC3 5.1][h264]-GroupA.mkv"),
+		"shows",
+	)
+	if epYearTitle.Kind != "episode" || epYearTitle.SeriesTitle != "1905" || epYearTitle.Title != "Beyond the Ridge" {
+		t.Fatalf("unexpected year-titled episode parse: %+v", epYearTitle)
+	}
+	if epYearTitle.Year == nil || *epYearTitle.Year != 2021 {
+		t.Fatalf("expected year 2021, got %v", epYearTitle.Year)
+	}
+	if epYearTitle.SeasonNumber == nil || *epYearTitle.SeasonNumber != 1 || epYearTitle.EpisodeNumber == nil || *epYearTitle.EpisodeNumber != 2 {
+		t.Fatalf("expected S01E02, got S%vE%v", epYearTitle.SeasonNumber, epYearTitle.EpisodeNumber)
+	}
+	if epYearTitle.ReleaseGroup != "GroupA" {
+		t.Fatalf("expected release group GroupA, got %q", epYearTitle.ReleaseGroup)
+	}
 }
 
 func TestParseMediaPath_MoviesWithYearsInTitle(t *testing.T) {
