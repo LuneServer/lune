@@ -235,7 +235,7 @@ func (s *Service) ResolveArtwork(ctx context.Context, artPath string) (string, e
 	if artPath == "" {
 		return "", ErrNotFound
 	}
-	if info, err := os.Stat(artPath); err == nil && info.Size() > 0 {
+	if info, err := os.Stat(artPath); err == nil && !info.IsDir() && info.Size() > 0 {
 		return artPath, nil
 	}
 	fetcher, ok := s.enricher.(metadata.LazyArtFetcher)

@@ -1571,7 +1571,7 @@ func (c *TMDBClient) EnsureArtwork(ctx context.Context, localPath string) (strin
 	if !isAllowedTMDBArtSize(size) || !isSafeArtFilename(filename) || shard != artShard(filename) {
 		return "", fmt.Errorf("%w: invalid tmdb artwork cache key", ErrArtworkNotFound)
 	}
-	if info, err := os.Stat(cleanPath); err == nil && info.Size() > 0 {
+	if info, err := os.Stat(cleanPath); err == nil && !info.IsDir() && info.Size() > 0 {
 		return cleanPath, nil
 	}
 	if c.personArtSem != nil {

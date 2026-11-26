@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -140,5 +141,132 @@ func TestLibraryScanBrowseAndIncrementalPrune(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &scanRes)
 	if scanRes.Removed != 1 {
 		t.Fatalf("expected 1 pruned item, got %+v", scanRes)
+	}
+}
+
+type stubLazyArtEnricher struct {
+	fn func(ctx context.Context, localPath string) (string, error)
+}
+
+func (stubLazyArtEnricher) EnrichMovie(context.Context, string, string, *int) (metadata.EnrichedInfo, error) {
+	return metadata.EnrichedInfo{}, nil
+}
+
+func (stubLazyArtEnricher) EnrichEpisode(context.Context, string, string, int, int, *int) (metadata.EnrichedInfo, error) {
+	return metadata.EnrichedInfo{}, nil
+}
+
+func (s stubLazyArtEnricher) EnsureArtwork(ctx context.Context, localPath string) (string, error) {
+	return s.fn(ctx, localPath)
+}
+
+func TestItemArtworkLazyResolutionAndStatusMapping(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	db, err := store.Open(ctx, filepath.Join(dataDir, "lune.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	mediaRoot := t.TempDir()
+	movieFile := filepath.Join(mediaRoot, "Interstellar (2014).mkv")
+	_ = os.WriteFile(movieFile, []byte("fake-mkv-payload"), 0o644)
+
+	authSvc := auth.NewService(db, nil)
+	libSvc := library.NewService(db, stubProber{}, nil)
+
+	h := NewHandler(Dependencies{
+		Config:    config.Config{EdgeMode: config.EdgeModeDev, DataDir: dataDir},
+		Store:     db,
+		Auth:      authSvc,
+		Library:   libSvc,
+		StartedAt: time.Now(),
+	})
+
+	rec := doJSON(t, h, http.MethodPost, "/api/v1/setup", map[string]any{
+		"username": "dan",
+		"password": "orbit-secret-99",
+	}, nil, "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup status = %d", rec.Code)
+	}
+	cookie := rec.Result().Cookies()[0]
+
+	rec = doJSON(t, h, http.MethodPost, "/api/v1/libraries", map[string]any{
+		"name":      "Movies",
+		"kind":      "movies",
+		"root_path": mediaRoot,
+	}, cookie, "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create library status = %d", rec.Code)
+	}
+	var libResp LibraryDTO
+	_ = json.Unmarshal(rec.Body.Bytes(), &libResp)
+
+	rec = doJSON(t, h, http.MethodPost, "/api/v1/libraries/"+libResp.ID+"/scan?sync=true", nil, cookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scan status = %d", rec.Code)
+	}
+
+	items, _, err := db.ListMediaItems(ctx, store.MediaListFilter{LibraryID: libResp.ID, Limit: 10})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("ListMediaItems: len=%d err=%v", len(items), err)
+	}
+	item := items[0]
+	lazyBackdrop := filepath.Join(dataDir, "artwork", "tmdb", "w1280", "in", "InterstellarBG.jpg")
+	item.BackdropPath = lazyBackdrop
+	if err := db.UpsertMediaItem(ctx, item); err != nil {
+		t.Fatalf("UpsertMediaItem: %v", err)
+	}
+
+	artURL := "/api/v1/items/" + item.ID + "/artwork/backdrop"
+
+	// 1. Not-found maps to 404.
+	libSvc.SetEnricher(stubLazyArtEnricher{fn: func(context.Context, string) (string, error) {
+		return "", metadata.ErrArtworkNotFound
+	}})
+	if r := doJSON(t, h, http.MethodGet, artURL, nil, cookie, ""); r.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for ErrArtworkNotFound, got %d", r.Code)
+	}
+
+	// 2. Transient upstream error maps to 503 with Cache-Control: no-store.
+	libSvc.SetEnricher(stubLazyArtEnricher{fn: func(context.Context, string) (string, error) {
+		return "", errors.New("upstream 503")
+	}})
+	if r := doJSON(t, h, http.MethodGet, artURL, nil, cookie, ""); r.Code != http.StatusServiceUnavailable || r.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("expected 503 + no-store, got %d (%q)", r.Code, r.Header().Get("Cache-Control"))
+	}
+
+	// 3. Upstream timeout maps to 504 with Cache-Control: no-store.
+	libSvc.SetEnricher(stubLazyArtEnricher{fn: func(context.Context, string) (string, error) {
+		return "", context.DeadlineExceeded
+	}})
+	if r := doJSON(t, h, http.MethodGet, artURL, nil, cookie, ""); r.Code != http.StatusGatewayTimeout || r.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("expected 504 + no-store, got %d (%q)", r.Code, r.Header().Get("Cache-Control"))
+	}
+
+	// 4. Successful lazy materialization serves the file with private cache header.
+	libSvc.SetEnricher(stubLazyArtEnricher{fn: func(_ context.Context, p string) (string, error) {
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(p, []byte("lazy-backdrop-bytes"), 0o644); err != nil {
+			return "", err
+		}
+		return p, nil
+	}})
+	if r := doJSON(t, h, http.MethodGet, artURL, nil, cookie, ""); r.Code != http.StatusOK || r.Body.String() != "lazy-backdrop-bytes" || r.Header().Get("Cache-Control") != "private, max-age=86400" {
+		t.Fatalf("expected 200 lazy backdrop, got status=%d cc=%q body=%q", r.Code, r.Header().Get("Cache-Control"), r.Body.String())
+	}
+
+	// 5. Directory path must not be served as artwork.
+	item.BackdropPath = dataDir
+	if err := db.UpsertMediaItem(ctx, item); err != nil {
+		t.Fatalf("UpsertMediaItem dir: %v", err)
+	}
+	libSvc.SetEnricher(nil)
+	if r := doJSON(t, h, http.MethodGet, artURL, nil, cookie, ""); r.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for directory artwork path, got %d", r.Code)
 	}
 }
