@@ -2,6 +2,8 @@
 
 This document describes the architecture, conventions, and engineering invariants of **Lune Server** (`github.com/LuneServer/lune`) and how it fits into the wider Lune platform.
 
+> **Mandatory Branch Workflow:** Never commit directly to `main` or pile unrelated changes onto an existing branch. Start every distinct task (feature, fix, or doc change) on its own branch from an up-to-date `main` (`git switch -c <type>/<short-topic>`, e.g. `fix/unraid-permissions`). For parallel or concurrent work, or when the working tree already holds uncommitted changes from another task, use a separate worktree (`git worktree add ../lune-<topic> -b <type>/<topic> main`) instead of switching branches in place. Keep each branch scoped to one concern, run `git status` before editing to confirm what you're building on, and when a task spans repos (`lune`, `lune-web`, `lune-brand`), use a same-named branch in each. Do not merge, rebase onto, or push unless the user asks.
+
 > **Mandatory Maintenance Rule:** Whenever you implement new functionality or change existing architecture (packages, HTTP endpoints, SQLite migrations, environment variables, streaming behavior, deployment manifests, or cross-repo contracts), **you must update this `AGENTS.md` in the same change**. If the change alters platform-level architecture, also update [`docs/architecture.md`](docs/architecture.md), and if it changes API contracts or static asset expectations consumed by the web client, update `lune-web/AGENTS.md` accordingly.
 
 ---
