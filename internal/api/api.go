@@ -16,6 +16,7 @@ import (
 	"github.com/LuneServer/lune/internal/auth"
 	"github.com/LuneServer/lune/internal/config"
 	"github.com/LuneServer/lune/internal/library"
+	"github.com/LuneServer/lune/internal/maintenance"
 	"github.com/LuneServer/lune/internal/requests"
 	"github.com/LuneServer/lune/internal/security"
 	"github.com/LuneServer/lune/internal/store"
@@ -26,14 +27,15 @@ import (
 
 // Dependencies wires runtime services into the HTTP API layer.
 type Dependencies struct {
-	Config    config.Config
-	Store     *store.Store
-	Auth      *auth.Service
-	Library   *library.Service
-	Stream    *stream.Service
-	Requests  *requests.Service
-	Logger    *slog.Logger
-	StartedAt time.Time
+	Config      config.Config
+	Store       *store.Store
+	Auth        *auth.Service
+	Library     *library.Service
+	Stream      *stream.Service
+	Requests    *requests.Service
+	Maintenance *maintenance.Service
+	Logger      *slog.Logger
+	StartedAt   time.Time
 }
 
 type HealthOutput struct {
@@ -75,6 +77,14 @@ func NewHandler(deps Dependencies) http.Handler {
 	}
 	if deps.Requests == nil && deps.Store != nil {
 		deps.Requests = requests.NewService(deps.Store, deps.Config, nil, nil)
+	}
+	if deps.Maintenance == nil && deps.Store != nil {
+		deps.Maintenance = maintenance.NewService(context.Background(), deps.Store, maintenance.Options{
+			DataDir:             deps.Config.DataDir,
+			IsScanRunning:       deps.Library.HasRunningScan,
+			ActiveTranscodeDirs: deps.Stream.ActiveTranscodeDirs,
+			Logger:              deps.Logger,
+		})
 	}
 	ipResolver := security.NewClientIPResolver(deps.Config.TrustedProxies)
 	edgeGuard := security.NewEdgeGuard()
@@ -204,6 +214,7 @@ func NewHandler(deps Dependencies) http.Handler {
 	registerUserAdminRoutes(api, deps.Auth)
 	registerInviteRoutes(api, runtimeNet, deps.Auth)
 	registerNetworkAdminRoutes(api, deps.Config, deps.Store, runtimeNet)
+	registerMaintenanceAdminRoutes(api, deps.Maintenance, deps.Store)
 	registerLibraryRoutes(r, api, deps.Library, deps.Auth, deps.Stream)
 	registerSeriesRoutes(api, deps.Library, deps.Auth)
 	registerRequestRoutes(api, deps.Requests)

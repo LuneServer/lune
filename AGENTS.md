@@ -55,6 +55,7 @@ lune/
 │   │   ├── series.go            # Series list, detail with progress, Up Next episode resolution
 │   │   ├── subtitles.go         # Local sidecar subtitle discovery (.vtt, .srt, .ass, .ssa; language/forced/Signs & Songs detection)
 │   │   └── watcher.go           # fsnotify debounced (5s) watcher + periodic fallback scan (for FUSE/Unraid)
+│   ├── maintenance/             # Guarded periodic & manual housekeeping (orphaned artwork, stale transcode/sub cache, audit log pruning, SQLite optimize/checkpoint) with live-reconfigurable server_settings["maintenance_config"]
 │   ├── metadata/                # Technical probing & descriptive enrichment
 │   │   ├── probe.go             # ffprobe wrapper extracting container, duration, bitrate, video/audio/sub streams, MKV chapters (OP/ED/Recap/Preview), normalized audio languages
 │   │   ├── nfo.go               # Local Kodi/Jellyfin-style .nfo XML parser (including `<originaltitle>`)
@@ -73,6 +74,7 @@ lune/
 │   │   ├── auth_middleware.go   # Request metadata (IP/UA/HTTPS) & optional Bearer/lune_session cookie auth
 │   │   ├── auth.go              # Setup, login, refresh, logout, me, sessions (+ revoke-others), RFC 8628 device flow, admin audit & alert dismissal
 │   │   ├── network.go           # Live runtimeNetwork state & admin network config endpoints (GET/PUT /api/v1/admin/network/config) with live hot-reload for local/proxy/tailscale and restart-required signaling for ACME
+│   │   ├── maintenance.go       # Admin housekeeping status, live config, and manual run endpoints (GET /api/v1/admin/maintenance, PUT /api/v1/admin/maintenance/config, POST /api/v1/admin/maintenance/run)
 │   │   ├── users.go             # Self-service profile/password/prefs/avatars/watchlist/favorites (/api/v1/users/*) & admin user/session management (/api/v1/admin/users/*)
 │   │   ├── invites.go           # Admin invite management (/api/v1/admin/invites) & public invite inspection/acceptance (/api/v1/invites/*)
 │   │   ├── library.go           # Libraries, scans, items (+ genre/person/studio filtering, pre-play tracks/progress, /similar local matching), /api/v1/metadata/search (admin visual identify), refresh (with explicit tmdb_id binding), binary artwork endpoint (enforcing library ACLs)

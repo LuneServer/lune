@@ -18,6 +18,7 @@ import (
 	"github.com/LuneServer/lune/internal/config"
 	"github.com/LuneServer/lune/internal/edge"
 	"github.com/LuneServer/lune/internal/library"
+	"github.com/LuneServer/lune/internal/maintenance"
 	"github.com/LuneServer/lune/internal/metadata"
 	"github.com/LuneServer/lune/internal/requests"
 	"github.com/LuneServer/lune/internal/security"
@@ -115,15 +116,24 @@ func main() {
 	}
 	defer streamSvc.Shutdown()
 
+	maintSvc := maintenance.NewService(ctx, db, maintenance.Options{
+		DataDir:             cfg.DataDir,
+		IsScanRunning:       libSvc.HasRunningScan,
+		ActiveTranscodeDirs: streamSvc.ActiveTranscodeDirs,
+		Logger:              logger,
+	})
+	go maintSvc.Run(ctx)
+
 	handler := api.NewHandler(api.Dependencies{
-		Config:    cfg,
-		Store:     db,
-		Auth:      authSvc,
-		Library:   libSvc,
-		Stream:    streamSvc,
-		Requests:  reqSvc,
-		Logger:    logger,
-		StartedAt: time.Now(),
+		Config:      cfg,
+		Store:       db,
+		Auth:        authSvc,
+		Library:     libSvc,
+		Stream:      streamSvc,
+		Requests:    reqSvc,
+		Maintenance: maintSvc,
+		Logger:      logger,
+		StartedAt:   time.Now(),
 	})
 
 	srv := edge.New(cfg, handler, logger)

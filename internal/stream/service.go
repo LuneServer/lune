@@ -184,6 +184,14 @@ func (s *Service) GetStreamingConfig() StreamingConfig {
 	return s.transcoder.GetConfig()
 }
 
+// ActiveTranscodeDirs returns the set of directory paths owned by live transcode sessions.
+func (s *Service) ActiveTranscodeDirs() map[string]struct{} {
+	if s == nil || s.transcoder == nil {
+		return map[string]struct{}{}
+	}
+	return s.transcoder.ActiveDirs()
+}
+
 // UpdateStreamingConfig validates, persists, and hot-reloads streaming/transcoding limits.
 func (s *Service) UpdateStreamingConfig(ctx context.Context, actor store.User, cfg StreamingConfig, clientIP string) (StreamingConfig, error) {
 	if cfg.IdleTimeoutMinutes == 0 {

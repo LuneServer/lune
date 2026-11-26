@@ -96,6 +96,22 @@ type subFlight struct {
 	err  error
 }
 
+// ActiveDirs returns the set of directory paths currently owned by live transcode sessions.
+func (t *Transcoder) ActiveDirs() map[string]struct{} {
+	out := make(map[string]struct{})
+	if t == nil {
+		return out
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, s := range t.sessions {
+		if s.dir != "" {
+			out[filepath.Clean(s.dir)] = struct{}{}
+		}
+	}
+	return out
+}
+
 // Transcoder orchestrates on-demand FFmpeg HLS remux/transcode sessions.
 type Transcoder struct {
 	ffmpegBin        string

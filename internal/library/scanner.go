@@ -175,9 +175,13 @@ func (s *Service) DeleteLibrary(ctx context.Context, id string) error {
 	if errors.Is(err, store.ErrNotFound) {
 		return ErrNotFound
 	}
-	s.mu.Lock()
-	delete(s.scans, id)
-	s.mu.Unlock()
+	if err == nil {
+		s.mu.Lock()
+		if st, ok := s.scans[id]; ok && !st.Running {
+			delete(s.scans, id)
+		}
+		s.mu.Unlock()
+	}
 	s.watcher.NotifyLibrariesChanged()
 	return err
 }
@@ -237,6 +241,21 @@ func (s *Service) GetScanStatus(libraryID string) ScanStatus {
 		return cp
 	}
 	return ScanStatus{LibraryID: libraryID}
+}
+
+// HasRunningScan reports whether any library currently has an active scan in progress.
+func (s *Service) HasRunningScan() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.scans {
+		if st.Running {
+			return true
+		}
+	}
+	return false
 }
 
 // StartScanAsync launches a background library scan.
