@@ -87,8 +87,7 @@ lune/
 │   └── version/                 # Build-time Version, Commit, BuildDate (set via -ldflags)
 ├── deploy/
 │   ├── docker-compose.yml       # Single-container deployment (PUID/PGID/UMASK, ports 80/443 or 5863, /data, /media:ro, optional /dev/dri)
-│   ├── docker-entrypoint.sh     # PUID/PGID/UMASK privilege-drop entrypoint (gosu, /data ownership sync, /dev/dri group setup, non-root --user passthrough)
-│   └── unraid/lune.xml          # Unraid Community Applications template
+│   └── docker-entrypoint.sh     # PUID/PGID/UMASK privilege-drop entrypoint (gosu, /data ownership sync, /dev/dri group setup, non-root --user passthrough)
 ├── .github/workflows/           # ci.yml (vet, race test, static build) & release.yml (validated workflow_dispatch release, GitHub Release & multi-arch GHCR)
 └── Dockerfile                   # Multi-stage static Go build + Debian bookworm-slim + FFmpeg runtime
 ```
@@ -192,5 +191,5 @@ LUNE_WEB_DIR=../lune-web/dist go run ./cmd/lune
 
 When implementing new functionality in `lune`, check and update:
 1. **This file (`AGENTS.md`):** Update the package layout, environment variable table, invariants, or verification commands whenever they change.
-2. **`deploy/docker-compose.yml` & `deploy/unraid/lune.xml`:** Add any new user-facing `LUNE_*` environment variables or volume/device requirements.
+2. **`deploy/docker-compose.yml` (and `LuneServer/unraid-templates`):** Add any new user-facing `LUNE_*` environment variables or volume/device requirements.
 3. **Cross-repo impact:** If you add or modify `/api/v1/*` routes or DTO fields, note or apply matching updates in `../lune-web/src/lib/api.ts` and `../lune-web/AGENTS.md`. Make those edits on the same-named branch in `../lune-web` (or in the matching worktree when that checkout has uncommitted changes from another task), never on whatever branch happens to be checked out there.
