@@ -17,19 +17,26 @@ var ErrProberUnavailable = errors.New("ffprobe binary not available")
 
 // StreamInfo describes an individual video, audio, or subtitle stream in a media file.
 type StreamInfo struct {
-	Index         int    `json:"index"`
-	Type          string `json:"type"` // "video" | "audio" | "subtitle"
-	Codec         string `json:"codec"`
-	Profile       string `json:"profile,omitempty"`
-	Language      string `json:"language,omitempty"`
-	Title         string `json:"title,omitempty"`
-	Width         int    `json:"width,omitempty"`
-	Height        int    `json:"height,omitempty"`
-	HDR           string `json:"hdr,omitempty"`
-	Channels      int    `json:"channels,omitempty"`
-	ChannelLayout string `json:"channel_layout,omitempty"`
-	Default       bool   `json:"default,omitempty"`
-	Forced        bool   `json:"forced,omitempty"`
+	Index          int    `json:"index"`
+	Type           string `json:"type"` // "video" | "audio" | "subtitle"
+	Codec          string `json:"codec"`
+	Profile        string `json:"profile,omitempty"`
+	PixFmt         string `json:"pix_fmt,omitempty"`
+	CodecTag       string `json:"codec_tag,omitempty"`
+	ColorSpace     string `json:"color_space,omitempty"`
+	ColorTransfer  string `json:"color_transfer,omitempty"`
+	ColorPrimaries string `json:"color_primaries,omitempty"`
+	DVProfile      int    `json:"dv_profile,omitempty"`
+	DVCompatID     int    `json:"dv_compat_id,omitempty"`
+	Language       string `json:"language,omitempty"`
+	Title          string `json:"title,omitempty"`
+	Width          int    `json:"width,omitempty"`
+	Height         int    `json:"height,omitempty"`
+	HDR            string `json:"hdr,omitempty"`
+	Channels       int    `json:"channels,omitempty"`
+	ChannelLayout  string `json:"channel_layout,omitempty"`
+	Default        bool   `json:"default,omitempty"`
+	Forced         bool   `json:"forced,omitempty"`
 }
 
 // ChapterInfo describes a container chapter marker (commonly used in anime MKVs for OP/ED/Recap).
@@ -125,9 +132,12 @@ type ffprobeOutput struct {
 		Index          int    `json:"index"`
 		CodecType      string `json:"codec_type"`
 		CodecName      string `json:"codec_name"`
+		CodecTagString string `json:"codec_tag_string"`
 		Profile        string `json:"profile"`
+		PixFmt         string `json:"pix_fmt"`
 		Width          int    `json:"width"`
 		Height         int    `json:"height"`
+		ColorSpace     string `json:"color_space"`
 		ColorTransfer  string `json:"color_transfer"`
 		ColorPrimaries string `json:"color_primaries"`
 		Channels       int    `json:"channels"`
@@ -138,9 +148,7 @@ type ffprobeOutput struct {
 			AttachedPic int `json:"attached_pic"`
 		} `json:"disposition"`
 		Tags         map[string]string `json:"tags"`
-		SideDataList []struct {
-			SideDataType string `json:"side_data_type"`
-		} `json:"side_data_list"`
+		SideDataList []ffprobeSideData `json:"side_data_list"`
 	} `json:"streams"`
 	Chapters []struct {
 		ID        int               `json:"id"`
@@ -178,22 +186,27 @@ func parseFFProbeJSON(raw []byte, path string) (ProbeResult, error) {
 		}
 
 		info := StreamInfo{
-			Index:         st.Index,
-			Type:          st.CodecType,
-			Codec:         strings.ToLower(st.CodecName),
-			Profile:       st.Profile,
-			Language:      tagCI(st.Tags, "language"),
-			Title:         tagCI(st.Tags, "title"),
-			Width:         st.Width,
-			Height:        st.Height,
-			Channels:      st.Channels,
-			ChannelLayout: st.ChannelLayout,
-			Default:       st.Disposition.Default == 1,
-			Forced:        st.Disposition.Forced == 1,
+			Index:          st.Index,
+			Type:           st.CodecType,
+			Codec:          strings.ToLower(st.CodecName),
+			Profile:        st.Profile,
+			PixFmt:         strings.ToLower(strings.TrimSpace(st.PixFmt)),
+			CodecTag:       strings.TrimSpace(st.CodecTagString),
+			ColorSpace:     strings.ToLower(strings.TrimSpace(st.ColorSpace)),
+			ColorTransfer:  strings.ToLower(strings.TrimSpace(st.ColorTransfer)),
+			ColorPrimaries: strings.ToLower(strings.TrimSpace(st.ColorPrimaries)),
+			Language:       tagCI(st.Tags, "language"),
+			Title:          tagCI(st.Tags, "title"),
+			Width:          st.Width,
+			Height:         st.Height,
+			Channels:       st.Channels,
+			ChannelLayout:  st.ChannelLayout,
+			Default:        st.Disposition.Default == 1,
+			Forced:         st.Disposition.Forced == 1,
 		}
 
 		if st.CodecType == "video" {
-			info.HDR = detectHDR(st.ColorTransfer, st.ColorPrimaries, st.SideDataList)
+			info.HDR, info.DVProfile, info.DVCompatID = detectHDR(st.ColorTransfer, st.ColorPrimaries, st.SideDataList)
 			if res.VideoCodec == "" {
 				res.VideoCodec = info.Codec
 				res.VideoWidth = info.Width
@@ -316,24 +329,32 @@ func ExtractAudioLanguages(streams []StreamInfo) []string {
 	return langs
 }
 
-func detectHDR(transfer, primaries string, sideData []struct {
+type ffprobeSideData struct {
 	SideDataType string `json:"side_data_type"`
-}) string {
+	DVProfile    int    `json:"dv_profile"`
+	DVCompatID   int    `json:"dv_bl_signal_compatibility_id"`
+}
+
+func detectHDR(transfer, primaries string, sideData []ffprobeSideData) (hdr string, dvProfile int, dvCompatID int) {
 	for _, sd := range sideData {
-		if strings.Contains(strings.ToLower(sd.SideDataType), "dovi") || strings.Contains(strings.ToLower(sd.SideDataType), "dolby vision") {
-			return "dovi"
+		lower := strings.ToLower(sd.SideDataType)
+		if strings.Contains(lower, "dovi") || strings.Contains(lower, "dolby vision") {
+			if sd.DVProfile == 7 || (sd.DVProfile == 8 && (sd.DVCompatID == 1 || sd.DVCompatID == 6)) {
+				return "dovi_hdr10", sd.DVProfile, sd.DVCompatID
+			}
+			return "dovi", sd.DVProfile, sd.DVCompatID
 		}
 	}
 	switch strings.ToLower(transfer) {
 	case "smpte2084":
-		return "hdr10"
+		return "hdr10", 0, 0
 	case "arib-std-b67":
-		return "hlg"
+		return "hlg", 0, 0
 	default:
 		if strings.ToLower(primaries) == "bt2020" {
-			return "hdr"
+			return "hdr", 0, 0
 		}
-		return "sdr"
+		return "sdr", 0, 0
 	}
 }
 

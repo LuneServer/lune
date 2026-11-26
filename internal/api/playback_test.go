@@ -473,9 +473,14 @@ func TestAdminStreamingConfigEndpoints(t *testing.T) {
 	if updated.MaxGlobalTranscodes != 6 || updated.MaxUserTranscodes != 2 || updated.IdleTimeoutMinutes != 15 {
 		t.Fatalf("unexpected updated streaming config: %+v", updated)
 	}
+	if updated.Transcoder == nil {
+		t.Fatalf("expected transcoder diagnostics in streaming config response")
+	}
 
 	// Live service reflects update immediately.
-	if live := streamSvc.GetStreamingConfig(); live != updated {
+	if live := streamSvc.GetStreamingConfig(); live.MaxGlobalTranscodes != updated.MaxGlobalTranscodes ||
+		live.MaxUserTranscodes != updated.MaxUserTranscodes ||
+		live.IdleTimeoutMinutes != updated.IdleTimeoutMinutes {
 		t.Fatalf("live streaming config = %+v, want %+v", live, updated)
 	}
 
@@ -485,7 +490,9 @@ func TestAdminStreamingConfigEndpoints(t *testing.T) {
 		t.Fatalf("restarted stream.NewService: %v", err)
 	}
 	defer restartedSvc.Shutdown()
-	if loaded := restartedSvc.GetStreamingConfig(); loaded != updated {
+	if loaded := restartedSvc.GetStreamingConfig(); loaded.MaxGlobalTranscodes != updated.MaxGlobalTranscodes ||
+		loaded.MaxUserTranscodes != updated.MaxUserTranscodes ||
+		loaded.IdleTimeoutMinutes != updated.IdleTimeoutMinutes {
 		t.Fatalf("reloaded streaming config = %+v, want %+v", loaded, updated)
 	}
 
