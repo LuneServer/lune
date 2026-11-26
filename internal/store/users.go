@@ -16,12 +16,13 @@ const (
 
 // UserPreferences holds per-user media playback & UI preferences.
 type UserPreferences struct {
-	AudioLanguage    string `json:"audio_language,omitempty"`
-	SubtitleLanguage string `json:"subtitle_language,omitempty"`
-	SubtitlesEnabled bool   `json:"subtitles_enabled"`
-	AutoplayNext     bool   `json:"autoplay_next"`
-	CombineNextUp    bool   `json:"combine_next_up" required:"false"`
-	MaxBitrate       int64  `json:"max_bitrate,omitempty"`
+	AudioLanguage    string   `json:"audio_language,omitempty"`
+	SubtitleLanguage string   `json:"subtitle_language,omitempty"`
+	SubtitlesEnabled bool     `json:"subtitles_enabled"`
+	AutoplayNext     bool     `json:"autoplay_next"`
+	CombineNextUp    bool     `json:"combine_next_up" required:"false"`
+	PosterBadges     []string `json:"poster_badges,omitempty" required:"false"`
+	MaxBitrate       int64    `json:"max_bitrate,omitempty"`
 }
 
 // DefaultUserPreferences returns sensible defaults for newly created accounts.

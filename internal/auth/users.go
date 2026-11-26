@@ -401,6 +401,25 @@ func (s *Service) UpdateSelfProfile(ctx context.Context, actor store.User, displ
 		if p.MaxBitrate < 0 {
 			return UserDetail{}, fmt.Errorf("%w: max_bitrate must be >= 0", ErrValidation)
 		}
+		if len(p.PosterBadges) > 0 {
+			seen := make(map[string]struct{}, len(p.PosterBadges))
+			cleaned := make([]string, 0, len(p.PosterBadges))
+			for _, raw := range p.PosterBadges {
+				badge := strings.ToLower(strings.TrimSpace(raw))
+				switch badge {
+				case "resolution", "hdr", "dual_audio", "seasons", "rating":
+					if _, dup := seen[badge]; !dup {
+						seen[badge] = struct{}{}
+						cleaned = append(cleaned, badge)
+					}
+				default:
+					return UserDetail{}, fmt.Errorf("%w: unknown poster badge %q", ErrValidation, raw)
+				}
+			}
+			p.PosterBadges = cleaned
+		} else {
+			p.PosterBadges = nil
+		}
 		curPrefs = p
 	}
 

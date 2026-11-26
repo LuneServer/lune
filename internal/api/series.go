@@ -23,6 +23,7 @@ type SeriesSummaryDTO struct {
 	ContentRating string    `json:"content_rating,omitempty"`
 	Genres        []string  `json:"genres,omitempty"`
 	Overview      string    `json:"overview,omitempty"`
+	VideoWidth    int       `json:"video_width,omitempty"`
 	VideoHeight   int       `json:"video_height,omitempty"`
 	VideoHDR      string    `json:"video_hdr,omitempty"`
 	SeasonCount   int       `json:"season_count"`
@@ -143,6 +144,7 @@ func toSeriesSummaryDTO(ss store.SeriesSummary) SeriesSummaryDTO {
 		ContentRating: ss.ContentRating,
 		Genres:        decodeStringList(ss.GenresJSON),
 		Overview:      ss.Overview,
+		VideoWidth:    ss.VideoWidth,
 		VideoHeight:   ss.VideoHeight,
 		VideoHDR:      ss.VideoHDR,
 		SeasonCount:   ss.SeasonCount,
