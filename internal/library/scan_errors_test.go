@@ -17,6 +17,17 @@ func (failingProber) Probe(_ context.Context, path string) (metadata.ProbeResult
 	return metadata.ProbeResult{}, os.ErrInvalid
 }
 
+// ctxCheckingProber succeeds for every file but fails if the probe context is
+// already done, so tests do not depend on a host ffprobe binary.
+type ctxCheckingProber struct{}
+
+func (ctxCheckingProber) Probe(ctx context.Context, path string) (metadata.ProbeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return metadata.ProbeResult{}, err
+	}
+	return metadata.ProbeResult{}, nil
+}
+
 func TestScanRecordsErrorDetails(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "lune.db"))
@@ -57,7 +68,7 @@ func TestScanSyncSurvivesCanceledRequestContext(t *testing.T) {
 	for _, n := range []string{"[G] Show - 01.mkv", "[G] Show - 02.mkv", "[G] Show - 03.mkv"} {
 		_ = os.WriteFile(filepath.Join(root, n), []byte("x"), 0o644)
 	}
-	svc := NewService(db, metadata.NewFFProbe(), nil)
+	svc := NewService(db, ctxCheckingProber{}, nil)
 	lib, err := svc.CreateLibrary(context.Background(), "Anime", "anime", root)
 	if err != nil {
 		t.Fatal(err)
