@@ -513,11 +513,11 @@ func (s *Store) ListMediaItems(ctx context.Context, f MediaListFilter) ([]MediaI
 	}
 	switch strings.ToLower(strings.TrimSpace(f.Resolution)) {
 	case "4k":
-		where = append(where, "video_height >= 2000")
+		where = append(where, "(video_width >= 3200 OR video_height >= 2000)")
 	case "1080p":
-		where = append(where, "video_height >= 1000 AND video_height < 2000")
+		where = append(where, "NOT (video_width >= 3200 OR video_height >= 2000) AND (video_width >= 1800 OR video_height >= 1000)")
 	case "720p":
-		where = append(where, "video_height >= 700 AND video_height < 1000")
+		where = append(where, "NOT (video_width >= 3200 OR video_height >= 2000) AND NOT (video_width >= 1800 OR video_height >= 1000) AND (video_width >= 1200 OR video_height >= 700)")
 	}
 	if f.HDR {
 		where = append(where, "video_hdr != '' AND lower(video_hdr) != 'sdr'")
@@ -888,7 +888,7 @@ func (s *Store) GetLibraryFacets(ctx context.Context, libraryID string) (Library
 	}
 
 	rows, err := s.reader.QueryContext(ctx, `
-		SELECT genres_json, content_rating, year, video_height, video_hdr, audio_languages
+		SELECT genres_json, content_rating, year, video_width, video_height, video_hdr, audio_languages
 		FROM media_items
 		WHERE library_id = ?
 	`, libraryID)
@@ -904,8 +904,8 @@ func (s *Store) GetLibraryFacets(ctx context.Context, libraryID string) (Library
 	for rows.Next() {
 		var genresJSON, cert, hdr, audioLangs string
 		var yr sql.NullInt64
-		var height int
-		if err := rows.Scan(&genresJSON, &cert, &yr, &height, &hdr, &audioLangs); err != nil {
+		var width, height int
+		if err := rows.Scan(&genresJSON, &cert, &yr, &width, &height, &hdr, &audioLangs); err != nil {
 			return facets, err
 		}
 		for _, g := range decodeJSONStrings(genresJSON) {
@@ -927,7 +927,7 @@ func (s *Store) GetLibraryFacets(ctx context.Context, libraryID string) (Library
 		if yr.Valid && yr.Int64 > 1880 {
 			yearSet[int(yr.Int64)] = struct{}{}
 		}
-		if height >= 2000 {
+		if width >= 3200 || height >= 2000 {
 			facets.Has4K = true
 		}
 		if hdr != "" && !strings.EqualFold(hdr, "sdr") {
