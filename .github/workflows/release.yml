@@ -121,7 +121,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
+      - id: web
+        uses: actions/checkout@v4
         with:
           repository: LuneServer/lune-web
           ref: ${{ inputs.web_ref }}
@@ -188,15 +189,18 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
           PRERELEASE: ${{ needs.validate.outputs.prerelease }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          WEB_COMMIT: ${{ steps.web.outputs.commit }}
         run: |
           set -euo pipefail
+
+          NOTES="$(printf 'Container image: `ghcr.io/luneserver/lune:%s` (`%s`)\nWeb UI: LuneServer/lune-web@%s' "${VERSION#v}" "${DIGEST}" "${WEB_COMMIT}")"
 
           ARGS=(
             release create "$VERSION"
             --target "$GITHUB_SHA"
             --title "$VERSION"
             --generate-notes
-            --notes "Container image: \`ghcr.io/luneserver/lune:${VERSION#v}\` (\`${DIGEST}\`)"
+            --notes "$NOTES"
           )
           if [[ "$PRERELEASE" == "true" ]]; then
             ARGS+=(--prerelease)
