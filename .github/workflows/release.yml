@@ -1,31 +1,138 @@
-name: Release Container
+name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer tag to release (e.g. v0.1.0 or v0.2.0-beta.1)"
+        required: true
+        type: string
+      prerelease:
+        description: "Prerelease build (must match -suffix on version; skips :latest tag)"
+        required: false
+        default: false
+        type: boolean
+      web_ref:
+        description: "LuneServer/lune-web branch or tag to bundle"
+        required: false
+        default: main
+        type: string
 
 permissions:
-  contents: read
+  contents: write
   packages: write
   id-token: write
   attestations: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  docker:
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      clean_version: ${{ steps.check.outputs.clean_version }}
+      minor_version: ${{ steps.check.outputs.minor_version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      build_date: ${{ steps.check.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate branch, SemVer tag, and commit delta
+        id: check
+        env:
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Only allow releases from main or release/* branches
+          if [[ "$REF_NAME" != "main" && "$REF_NAME" != release/* ]]; then
+            echo "::error::Releases must be triggered from 'main' or a 'release/*' branch (got '$REF_NAME')."
+            exit 1
+          fi
+
+          # Enforce strict SemVer with leading 'v'
+          if [[ ! "$VERSION" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid SemVer tag '$VERSION'. Expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease (e.g. v0.1.0 or v0.2.0-rc.1)."
+            exit 1
+          fi
+
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          SUFFIX="${BASH_REMATCH[4]:-}"
+
+          # Ensure prerelease toggle matches presence of a prerelease suffix
+          if [[ -n "$SUFFIX" && "$PRERELEASE" != "true" ]]; then
+            echo "::error::Tag '$VERSION' has a prerelease suffix ('$SUFFIX') but prerelease=false."
+            exit 1
+          fi
+          if [[ -z "$SUFFIX" && "$PRERELEASE" == "true" ]]; then
+            echo "::error::prerelease=true requires a prerelease suffix on '$VERSION' (e.g. ${VERSION}-rc.1)."
+            exit 1
+          fi
+
+          # Prevent reusing an existing tag
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::Tag '$VERSION' already exists."
+            exit 1
+          fi
+
+          # Ensure there are new commits since the last tag on this branch (if any)
+          if PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null)"; then
+            COMMITS_SINCE="$(git rev-list "${PREV_TAG}..HEAD" --count)"
+            if [[ "$COMMITS_SINCE" -eq 0 ]]; then
+              echo "::error::No new commits since previous tag '${PREV_TAG}'."
+              exit 1
+            fi
+            echo "Found ${COMMITS_SINCE} new commit(s) since ${PREV_TAG}."
+          else
+            echo "No previous tags found; creating initial release ${VERSION}."
+          fi
+
+          {
+            echo "version=${VERSION}"
+            echo "clean_version=${VERSION#v}"
+            echo "minor_version=${MAJOR}.${MINOR}"
+            echo "prerelease=${PRERELEASE}"
+            echo "build_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet & Test
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+
+  publish:
+    name: Build Container & Publish Release
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/checkout@v4
         with:
           repository: LuneServer/lune-web
+          ref: ${{ inputs.web_ref }}
           path: _lune-web
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: _lune-web/package-lock.json
+
       - name: Build lune-web SPA bundle
         working-directory: _lune-web
         run: |
@@ -33,22 +140,25 @@ jobs:
           npm run build
           rm -rf ../web-dist/*
           cp -r dist/* ../web-dist/
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/luneserver/lune
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ needs.validate.outputs.clean_version }}
+            type=raw,value=${{ needs.validate.outputs.minor_version }},enable=${{ needs.validate.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.prerelease == 'false' }}
+
       - id: build
         uses: docker/build-push-action@v6
         with:
@@ -58,15 +168,38 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ needs.validate.outputs.version }}
             COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            BUILD_DATE=${{ needs.validate.outputs.build_date }}
           secrets: |
             tmdb_api_key=${{ secrets.LUNE_TMDB_API_KEY }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
       - uses: actions/attest-build-provenance@v2
         with:
           subject-name: ghcr.io/luneserver/lune
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      - name: Create Git tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          ARGS=(
+            release create "$VERSION"
+            --target "$GITHUB_SHA"
+            --title "$VERSION"
+            --generate-notes
+            --notes "Container image: \`ghcr.io/luneserver/lune:${VERSION#v}\` (\`${DIGEST}\`)"
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            ARGS+=(--prerelease)
+          fi
+
+          gh "${ARGS[@]}"
