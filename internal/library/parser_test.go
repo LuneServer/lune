@@ -251,3 +251,44 @@ func TestDiscoverSubtitles_ASSAndSigns(t *testing.T) {
 		t.Fatalf("expected Signs & Songs forced track, got %+v", tracks)
 	}
 }
+
+func TestParseMediaPath_ExternalIDTags(t *testing.T) {
+	movieRoot := filepath.Join(t.TempDir(), "movies")
+	m1 := ParseMediaPath(movieRoot, filepath.Join(movieRoot, "Dune (2021) {tmdb-438631}", "Dune (2021) {tmdb-438631}.mkv"), "movies")
+	if m1.Title != "Dune" || m1.Year == nil || *m1.Year != 2021 || m1.TMDBID != "438631" {
+		t.Fatalf("unexpected curly tmdb parse: %+v", m1)
+	}
+
+	m2 := ParseMediaPath(movieRoot, filepath.Join(movieRoot, "[tmdbid-129] Spirited Away (2001) {imdb-tt0245429}.mkv"), "movies")
+	if m2.Title != "Spirited Away" || m2.TMDBID != "129" || m2.IMDBID != "tt0245429" || m2.ReleaseGroup != "" {
+		t.Fatalf("unexpected bracket tmdbid + imdb parse: %+v", m2)
+	}
+
+	seriesDir := filepath.Join(movieRoot, "Series {tmdb-63639} {imdb-tt3230854}")
+	m3 := ParseMediaPath(movieRoot, filepath.Join(seriesDir, "Movies", "Film.mkv"), "movies")
+	if m3.Kind != "movie" || m3.TMDBID != "" || m3.IMDBID != "" {
+		t.Fatalf("movie inherited an ancestor series ID: %+v", m3)
+	}
+	m4 := ParseMediaPath(movieRoot, filepath.Join(seriesDir, "Film {tmdb-129}", "Film {imdb-tt0245429}.mkv"), "movies")
+	if m4.TMDBID != "129" || m4.IMDBID != "tt0245429" {
+		t.Fatalf("movie lost its own folder or filename ID: %+v", m4)
+	}
+
+	showRoot := filepath.Join(t.TempDir(), "shows")
+	ep := ParseMediaPath(showRoot, filepath.Join(showRoot, "The Expanse (2015) [tmdbid-63639]", "Season 01", "S01E04 - CQB.mkv"), "shows")
+	if ep.SeriesTitle != "The Expanse" || ep.TMDBID != "63639" || ep.SeasonNumber == nil || *ep.SeasonNumber != 1 || ep.EpisodeNumber == nil || *ep.EpisodeNumber != 4 {
+		t.Fatalf("unexpected series folder tmdbid inheritance: %+v", ep)
+	}
+
+	// Year-like TMDB ID (2020) in folder name must NOT be mistaken for a release year or truncate the series title.
+	epYearTag := ParseMediaPath(showRoot, filepath.Join(showRoot, "Arcane {tmdb-2020}", "Season 01", "S01E01.mkv"), "shows")
+	if epYearTag.SeriesTitle != "Arcane" || epYearTag.Year != nil || epYearTag.TMDBID != "2020" {
+		t.Fatalf("year-like tmdb tag corrupted series/year: %+v", epYearTag)
+	}
+
+	animeRoot := filepath.Join(t.TempDir(), "anime")
+	animeYearTag := ParseMediaPath(animeRoot, filepath.Join(animeRoot, "Frieren {tmdb-2023}", "01.mkv"), "anime")
+	if animeYearTag.SeriesTitle != "Frieren" || animeYearTag.Year != nil || animeYearTag.TMDBID != "2023" {
+		t.Fatalf("year-like tmdb tag corrupted anime series/year: %+v", animeYearTag)
+	}
+}

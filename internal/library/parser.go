@@ -23,8 +23,11 @@ var (
 	reDelimitedYear   = regexp.MustCompile(`[\(\[]((?:19|20)\d{2})[\)\]]`)
 	reYear            = regexp.MustCompile(`(?:\(|\[|\b)((?:19|20)\d{2})(?:\)|\]|\b)`)
 	reQualityTail     = regexp.MustCompile(`(?i)(?:^|[\s._\-\(\[])(2160p|1080p|720p|480p|4k|uhd|remux|bluray|blu-ray|bdrip|bdremux|web-dl|webrip|hdtv|hdr10|dv|dovi|x265|x264|hevc|av1|h\.?264|h\.?265|hi10p|10bit|8bit|atmos|dts|truehd|flac|aac|dual[\s._-]?audio|multi[\s._-]?sub).*$`)
-	reBrackets        = regexp.MustCompile(`\[[^\]]*\]`)
-	reParensMeta      = regexp.MustCompile(`(?i)\([^)]*(?:2160p|1080p|720p|480p|bd|blu-?ray|web-?dl|webrip|hevc|x265|x264|av1|10bit|hi10p|flac|aac|opus|dual[\s._-]?audio|multi[\s._-]?sub|\d{3,4}x\d{3,4}|[0-9a-f]{8})[^)]*\)`)
+	reBrackets       = regexp.MustCompile(`\[[^\]]*\]`)
+	reCurlyTags      = regexp.MustCompile(`\{[^}]*\}`)
+	rePathTMDBID     = regexp.MustCompile(`(?i)[\{\[\(]\s*tmdb(?:id)?[-=:\s]+(\d{1,10})\s*[\}\]\)]`)
+	rePathIMDBID     = regexp.MustCompile(`(?i)[\{\[\(]\s*(?:imdb(?:id)?[-=:\s]+)?(tt\d{6,10})\s*[\}\]\)]`)
+	reParensMeta     = regexp.MustCompile(`(?i)\([^)]*(?:2160p|1080p|720p|480p|bd|blu-?ray|web-?dl|webrip|hevc|x265|x264|av1|10bit|hi10p|flac|aac|opus|dual[\s._-]?audio|multi[\s._-]?sub|\d{3,4}x\d{3,4}|[0-9a-f]{8})[^)]*\)`)
 	reSpaces          = regexp.MustCompile(`\s+`)
 	reLeadingGroup    = regexp.MustCompile(`^\s*\[([^\]]{1,40})\]`)
 	reAnimeDashEp     = regexp.MustCompile(`(?i)^(.+?)\s+[-–—]\s+(\d{1,4})(?:v\d+)?(?:\s+[-–—]\s+(.+?))?(?:\s*$|\s+[\(\[])`)
@@ -49,6 +52,8 @@ type ParsedFile struct {
 	EpisodeNumber         *int
 	AbsoluteEpisodeNumber *int
 	ReleaseGroup          string
+	TMDBID                string
+	IMDBID                string
 	PosterPath            string
 	BackdropPath          string
 }
@@ -94,6 +99,7 @@ func ParseMediaPath(rootPath, fullPath, libraryKind string) ParsedFile {
 		out.SortTitle = makeSortTitle(out.Title)
 	}
 
+	out.TMDBID, out.IMDBID = extractPathExternalIDs(rootPath, fullPath, base, out.Kind != "movie")
 	out.PosterPath, out.BackdropPath = findSidecarArtwork(rootPath, dir)
 	return out
 }
@@ -112,7 +118,7 @@ func parseMovie(dir, base string) ParsedFile {
 		out.Title = cleanTitle(cleaned)
 	}
 	if out.Year == nil {
-		parent := filepath.Base(dir)
+		parent := stripExternalIDTags(filepath.Base(dir))
 		if _, _, y, ok := findReleaseYear(parent); ok {
 			out.Year = &y
 		}
@@ -491,7 +497,7 @@ func inspectAnimeDirs(rootPath, itemDir string) (series string, year *int, seaso
 			}
 		}
 		if i == 0 || series == "" {
-			raw := p
+			raw := stripExternalIDTags(p)
 			if start, _, y, ok := findReleaseYear(raw); ok {
 				year = &y
 				raw = raw[:start]
@@ -513,7 +519,7 @@ func inferSeriesFromDirs(rootPath, fullPath string, out *ParsedFile) {
 	}
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	if len(parts) > 0 && parts[0] != "" {
-		series := parts[0]
+		series := stripExternalIDTags(parts[0])
 		if start, _, y, ok := findReleaseYear(series); ok {
 			out.Year = &y
 			series = series[:start]
@@ -531,11 +537,56 @@ func extractReleaseGroup(base string) string {
 	if cand == "" || reTechBracketTag.MatchString(cand) {
 		return ""
 	}
+	bracketed := "[" + cand + "]"
+	if rePathTMDBID.MatchString(bracketed) || rePathIMDBID.MatchString(bracketed) {
+		return ""
+	}
 	return cand
 }
 
+// extractPathExternalIDs checks the filename and its folder for provider tags.
+// For episodes, ancestor folders can also supply series IDs.
+func extractPathExternalIDs(rootPath, fullPath, base string, includeAncestors bool) (tmdbID, imdbID string) {
+	check := func(s string) {
+		if tmdbID == "" {
+			if m := rePathTMDBID.FindStringSubmatch(s); len(m) > 1 {
+				tmdbID = m[1]
+			}
+		}
+		if imdbID == "" {
+			if m := rePathIMDBID.FindStringSubmatch(s); len(m) > 1 {
+				imdbID = strings.ToLower(m[1])
+			}
+		}
+	}
+	check(base)
+	if tmdbID != "" && imdbID != "" {
+		return tmdbID, imdbID
+	}
+	rel, err := filepath.Rel(rootPath, filepath.Dir(fullPath))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return tmdbID, imdbID
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for i := len(parts) - 1; i >= 0; i-- {
+		check(parts[i])
+		if !includeAncestors || (tmdbID != "" && imdbID != "") {
+			break
+		}
+	}
+	return tmdbID, imdbID
+}
+
+func stripExternalIDTags(raw string) string {
+	s := rePathTMDBID.ReplaceAllString(raw, " ")
+	s = rePathIMDBID.ReplaceAllString(s, " ")
+	return s
+}
+
 func stripAnimeMeta(raw string) string {
-	s := reBrackets.ReplaceAllString(raw, " ")
+	s := stripExternalIDTags(raw)
+	s = reCurlyTags.ReplaceAllString(s, " ")
+	s = reBrackets.ReplaceAllString(s, " ")
 	s = reParensMeta.ReplaceAllString(s, " ")
 	s = reSpaces.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
@@ -610,7 +661,10 @@ func firstIntPtr(a, b *int) *int {
 }
 
 func cleanTitle(raw string) string {
-	s := reBrackets.ReplaceAllString(raw, " ")
+	s := rePathTMDBID.ReplaceAllString(raw, " ")
+	s = rePathIMDBID.ReplaceAllString(s, " ")
+	s = reCurlyTags.ReplaceAllString(s, " ")
+	s = reBrackets.ReplaceAllString(s, " ")
 	s = strings.NewReplacer(".", " ", "_", " ").Replace(s)
 	s = strings.TrimSpace(strings.Trim(s, "-–— "))
 	s = reSpaces.ReplaceAllString(s, " ")
