@@ -189,8 +189,10 @@ func (s *Service) loadPersisted(ctx context.Context) {
 			s.lastScheduledAt = ts.UTC()
 		}
 	}
-	if s.lastScheduledAt.IsZero() && s.lastRun != nil && s.lastRun.Trigger == "scheduled" && !s.lastRun.FinishedAt.IsZero() {
-		s.lastScheduledAt = s.lastRun.FinishedAt.UTC()
+	if s.lastRun != nil && s.lastRun.Trigger == "scheduled" && !s.lastRun.FinishedAt.IsZero() {
+		if s.lastScheduledAt.IsZero() || s.lastRun.FinishedAt.After(s.lastScheduledAt) {
+			s.lastScheduledAt = s.lastRun.FinishedAt.UTC()
+		}
 	}
 }
 
