@@ -198,7 +198,7 @@ jobs:
           ARGS=(
             release create "$VERSION"
             --target "$GITHUB_SHA"
-            --title "$VERSION"
+            --title "${VERSION#v}"
             --generate-notes
             --notes "$NOTES"
           )
