@@ -1,0 +1,12 @@
+/data/
+/bin/
+/lune
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+_lune-web/
+web-dist/*
+!web-dist/.gitkeep

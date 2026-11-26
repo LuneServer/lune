@@ -1,0 +1,37 @@
+services:
+  lune:
+    image: ghcr.io/luneserver/lune:latest
+    build:
+      context: ..
+    container_name: lune
+    restart: unless-stopped
+    ports:
+      # Built-in ACME HTTPS mode (LUNE_EDGE_MODE=acme):
+      - "80:80"
+      - "443:443"
+      # Or LAN / reverse-proxy / Tailscale mode (LUNE_EDGE_MODE=local|proxy|tailscale):
+      # - "5863:5863"
+    environment:
+      # Access mode: local | acme | proxy | tailscale
+      LUNE_EDGE_MODE: acme
+      LUNE_DOMAIN: lune.example.com
+      LUNE_ACME_EMAIL: admin@example.com
+      # Optional: canonical external URL (useful for proxy or tailscale modes)
+      # LUNE_PUBLIC_URL: https://lune.example.com
+      # Optional: if using LUNE_EDGE_MODE=proxy, standard Docker/RFC1918 proxy subnets are trusted by default;
+      # set LUNE_TRUSTED_PROXIES to narrow or override them.
+      # LUNE_TRUSTED_PROXIES: 172.16.0.0/12
+      # Optional: use Cloudflare DNS-01 instead of port-80 HTTP-01 validation
+      # LUNE_ACME_DNS_PROVIDER: cloudflare
+      # LUNE_CF_API_TOKEN: your-cloudflare-dns-edit-token
+      # Optional: override TMDB key or proxy URL
+      # LUNE_TMDB_API_KEY: your-tmdb-v3-api-key
+      # LUNE_TMDB_BASE_URL: https://tmdb.example.com
+      LUNE_DATA_DIR: /data
+      LUNE_MEDIA_DIR: /media
+    volumes:
+      - ./data:/data
+      - /path/to/media:/media:ro
+    # Optional: pass through Intel QuickSync / VAAPI GPU for hardware transcoding
+    # devices:
+    #   - /dev/dri:/dev/dri

@@ -1,0 +1,12 @@
+# Never copy local secrets, runtime state, or git metadata into Docker builds
+.git
+.env
+.env.*
+data/
+bin/
+lune
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+_lune-web/
