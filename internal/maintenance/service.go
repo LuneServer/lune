@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	ConfigSettingKey  = "maintenance_config"
-	LastRunSettingKey = "maintenance_last_run"
+	ConfigSettingKey        = "maintenance_config"
+	LastRunSettingKey       = "maintenance_last_run"
+	LastScheduledSettingKey = "maintenance_last_scheduled_at"
 )
 
 var (
@@ -30,7 +31,7 @@ var (
 type Config struct {
 	Enabled                bool   `json:"enabled"`
 	IntervalHours          int    `json:"interval_hours"`           // 1..720 (default 24)
-	ScheduleTime           string `json:"schedule_time,omitempty"`  // Optional 24h local time "HH:MM" (default "03:00"; "" = rolling)
+	ScheduleTime           string `json:"schedule_time"`            // Optional 24h local time "HH:MM" (default "03:00"; "" = rolling)
 	CleanupOrphanedArtwork bool   `json:"cleanup_orphaned_artwork"` // default true
 	ArtworkGraceHours      int    `json:"artwork_grace_hours"`      // 1..168 (default 24)
 	CleanupTranscodeCache  bool   `json:"cleanup_transcode_cache"`  // default true
@@ -139,11 +140,13 @@ type Service struct {
 
 	reconfigCh chan struct{}
 
-	mu        sync.Mutex
-	cfg       Config
-	running   bool
-	lastRun   *RunReport
-	nextRunAt *time.Time
+	updateMu        sync.Mutex
+	mu              sync.Mutex
+	cfg             Config
+	running         bool
+	lastRun         *RunReport
+	lastScheduledAt time.Time
+	nextRunAt       *time.Time
 }
 
 // NewService constructs a maintenance service and hydrates saved config/last-run state from SQLite.
@@ -181,6 +184,14 @@ func (s *Service) loadPersisted(ctx context.Context) {
 			s.lastRun = &rep
 		}
 	}
+	if raw, err := s.store.GetSetting(ctx, LastScheduledSettingKey); err == nil && strings.TrimSpace(raw) != "" {
+		if ts, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw)); err == nil && !ts.IsZero() {
+			s.lastScheduledAt = ts.UTC()
+		}
+	}
+	if s.lastScheduledAt.IsZero() && s.lastRun != nil && s.lastRun.Trigger == "scheduled" && !s.lastRun.FinishedAt.IsZero() {
+		s.lastScheduledAt = s.lastRun.FinishedAt.UTC()
+	}
 }
 
 // Status returns a snapshot of current configuration, running state, last run report, and next run time.
@@ -212,6 +223,9 @@ func (s *Service) UpdateConfig(ctx context.Context, cfg Config) (Status, error) 
 	if err := cfg.Validate(); err != nil {
 		return Status{}, err
 	}
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
 	if s.store != nil {
 		b, err := json.Marshal(cfg)
 		if err != nil {
@@ -292,14 +306,19 @@ func (s *Service) RunNow(ctx context.Context) (Status, error) {
 }
 
 func (s *Service) computeNextRunLocked(now time.Time) time.Time {
-	return computeNextRun(now, s.cfg, s.lastRun, time.Local)
+	return computeNextRun(now, s.cfg, s.lastRun, s.lastScheduledAt, time.Local)
 }
 
-func computeNextRun(now time.Time, cfg Config, lastRun *RunReport, loc *time.Location) time.Time {
+func computeNextRun(now time.Time, cfg Config, lastRun *RunReport, lastScheduledAt time.Time, loc *time.Location) time.Time {
 	if loc == nil {
 		loc = time.Local
 	}
 	interval := time.Duration(cfg.IntervalHours) * time.Hour
+
+	scheduledAnchor := lastScheduledAt
+	if scheduledAnchor.IsZero() && lastRun != nil && lastRun.Trigger == "scheduled" && !lastRun.FinishedAt.IsZero() {
+		scheduledAnchor = lastRun.FinishedAt
+	}
 
 	if h, m, ok := parseScheduleTime(cfg.ScheduleTime); ok {
 		nowLocal := now.In(loc)
@@ -318,8 +337,8 @@ func computeNextRun(now time.Time, cfg Config, lastRun *RunReport, loc *time.Loc
 			for !candidate.After(nowLocal) {
 				candidate = candidate.Add(interval)
 			}
-			if lastRun != nil && lastRun.Trigger == "scheduled" && !lastRun.FinishedAt.IsZero() {
-				minNext := lastRun.FinishedAt.In(loc).Add(interval / 2)
+			if !scheduledAnchor.IsZero() {
+				minNext := scheduledAnchor.In(loc).Add(interval / 2)
 				for candidate.Before(minNext) {
 					candidate = candidate.Add(interval)
 				}
@@ -332,8 +351,8 @@ func computeNextRun(now time.Time, cfg Config, lastRun *RunReport, loc *time.Loc
 		if days < 1 {
 			days = 1
 		}
-		if lastRun != nil && lastRun.Trigger == "scheduled" && !lastRun.FinishedAt.IsZero() {
-			lastLocal := lastRun.FinishedAt.In(loc)
+		if !scheduledAnchor.IsZero() {
+			lastLocal := scheduledAnchor.In(loc)
 			candidate := time.Date(lastLocal.Year(), lastLocal.Month(), lastLocal.Day(), h, m, 0, 0, loc).AddDate(0, 0, days)
 			if candidate.After(nowLocal) {
 				return candidate.UTC()
@@ -371,12 +390,18 @@ func (s *Service) runOnce(ctx context.Context, trigger string) (RunReport, error
 		s.mu.Lock()
 		s.running = false
 		if s.cfg.Enabled {
-			next := time.Now().UTC().Add(time.Duration(s.cfg.IntervalHours) * time.Hour)
+			next := s.computeNextRunLocked(time.Now().UTC())
 			s.nextRunAt = &next
 		} else {
 			s.nextRunAt = nil
 		}
 		s.mu.Unlock()
+
+		// Wake scheduler so its active timer stays aligned with the recalculated NextRunAt.
+		select {
+		case s.reconfigCh <- struct{}{}:
+		default:
+		}
 	}()
 
 	started := time.Now().UTC()
@@ -442,11 +467,23 @@ func (s *Service) runOnce(ctx context.Context, trigger string) (RunReport, error
 	s.mu.Lock()
 	cp := report
 	s.lastRun = &cp
+	if trigger == "scheduled" {
+		s.lastScheduledAt = report.FinishedAt
+	}
 	s.mu.Unlock()
 
 	if s.store != nil {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
 		if b, err := json.Marshal(report); err == nil {
-			_ = s.store.SetSetting(ctx, LastRunSettingKey, string(b))
+			if err := s.store.SetSetting(persistCtx, LastRunSettingKey, string(b)); err != nil {
+				s.logger.Warn("failed to persist maintenance run report", "error", err)
+			}
+		}
+		if trigger == "scheduled" {
+			if err := s.store.SetSetting(persistCtx, LastScheduledSettingKey, report.FinishedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+				s.logger.Warn("failed to persist last scheduled maintenance timestamp", "error", err)
+			}
 		}
 	}
 

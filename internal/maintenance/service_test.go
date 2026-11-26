@@ -195,7 +195,7 @@ func TestScheduleTimeValidationAndNextRun(t *testing.T) {
 
 	// Before 03:00 -> runs today at 03:00.
 	nowBefore := time.Date(2026, 11, 26, 1, 30, 0, 0, loc)
-	next := computeNextRun(nowBefore, cfg, nil, loc)
+	next := computeNextRun(nowBefore, cfg, nil, time.Time{}, loc)
 	want := time.Date(2026, 11, 26, 3, 0, 0, 0, loc)
 	if !next.Equal(want) {
 		t.Fatalf("before 03:00: got %v, want %v", next, want)
@@ -203,33 +203,69 @@ func TestScheduleTimeValidationAndNextRun(t *testing.T) {
 
 	// After 03:00 -> runs tomorrow at 03:00.
 	nowAfter := time.Date(2026, 11, 26, 10, 0, 0, 0, loc)
-	next = computeNextRun(nowAfter, cfg, nil, loc)
+	next = computeNextRun(nowAfter, cfg, nil, time.Time{}, loc)
 	want = time.Date(2026, 11, 27, 3, 0, 0, 0, loc)
 	if !next.Equal(want) {
 		t.Fatalf("after 03:00: got %v, want %v", next, want)
 	}
 
-	// Multi-day interval (72h = 3 days) after a scheduled run -> 3 days later at 03:00.
+	// Multi-day interval (72h = 3 days) after a scheduled run -> 3 days later at 03:00,
+	// even if a manual run happened later that day and overwrote lastRun.
 	cfg3d := DefaultConfig()
 	cfg3d.IntervalHours = 72
 	cfg3d.ScheduleTime = "03:00"
-	lastScheduled := &RunReport{
-		Trigger:    "scheduled",
-		FinishedAt: time.Date(2026, 11, 26, 3, 0, 5, 0, loc),
+	scheduledAt := time.Date(2026, 11, 26, 3, 0, 5, 0, loc)
+	laterManual := &RunReport{
+		Trigger:    "manual",
+		FinishedAt: time.Date(2026, 11, 26, 14, 0, 0, 0, loc),
 	}
-	next = computeNextRun(time.Date(2026, 11, 26, 3, 0, 10, 0, loc), cfg3d, lastScheduled, loc)
+	next = computeNextRun(time.Date(2026, 11, 26, 14, 5, 0, 0, loc), cfg3d, laterManual, scheduledAt, loc)
 	want = time.Date(2026, 11, 29, 3, 0, 0, 0, loc)
 	if !next.Equal(want) {
-		t.Fatalf("72h scheduled: got %v, want %v", next, want)
+		t.Fatalf("72h scheduled preserved across manual run: got %v, want %v", next, want)
 	}
 
 	// Sub-day interval (12h) anchored at 03:00 -> 15:00 when now is 10:00.
 	cfg12h := DefaultConfig()
 	cfg12h.IntervalHours = 12
 	cfg12h.ScheduleTime = "03:00"
-	next = computeNextRun(nowAfter, cfg12h, nil, loc)
+	next = computeNextRun(nowAfter, cfg12h, nil, time.Time{}, loc)
 	want = time.Date(2026, 11, 26, 15, 0, 0, 0, loc)
 	if !next.Equal(want) {
 		t.Fatalf("12h anchored at 03:00: got %v, want %v", next, want)
+	}
+}
+
+func TestRollingScheduleTimePersistsAndCanceledRunPersistsReport(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	db, err := store.Open(ctx, filepath.Join(dataDir, "lune.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	svc := NewService(ctx, db, Options{DataDir: dataDir})
+
+	// Explicit empty schedule_time (Rolling) must survive reload instead of reverting to "03:00".
+	rolling := DefaultConfig()
+	rolling.ScheduleTime = ""
+	if _, err := svc.UpdateConfig(ctx, rolling); err != nil {
+		t.Fatalf("UpdateConfig rolling: %v", err)
+	}
+	reloaded := NewService(ctx, db, Options{DataDir: dataDir})
+	if reloaded.Status().Config.ScheduleTime != "" {
+		t.Fatalf("expected empty schedule_time to persist across reload, got %q", reloaded.Status().Config.ScheduleTime)
+	}
+
+	// A run whose operation context is already canceled must still persist its terminal RunReport.
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := svc.RunNow(canceledCtx); err != nil {
+		t.Fatalf("RunNow with canceled ctx: %v", err)
+	}
+	reloadedAfterCancel := NewService(ctx, db, Options{DataDir: dataDir})
+	if reloadedAfterCancel.Status().LastRun == nil {
+		t.Fatal("expected terminal RunReport to be persisted even when run context was canceled")
 	}
 }
