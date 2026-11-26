@@ -87,6 +87,15 @@ func (s *Store) Optimize(ctx context.Context) error {
 	return err
 }
 
+// CheckpointPassive runs a non-blocking passive WAL checkpoint.
+func (s *Store) CheckpointPassive(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`)
+	return err
+}
+
 // Close runs lightweight query-planner optimization + passive WAL checkpoint, then closes both pools.
 func (s *Store) Close() error {
 	if s == nil {
