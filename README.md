@@ -25,6 +25,9 @@
   </p>
 </div>
 
+> [!WARNING]
+> **Early development:** Lune is under active development and may be unstable. New versions are released frequently as the project evolves. If you're a developer who wants to help shape it, contributions and feedback are very welcome.
+
 ---
 
 ## Why Lune?
