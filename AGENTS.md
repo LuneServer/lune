@@ -185,6 +185,8 @@ go run ./cmd/lune
 LUNE_WEB_DIR=../lune-web/dist go run ./cmd/lune
 ```
 
+Release builds inject the tag **without** its leading `v` (tag `v0.1.0-beta.1` -> `version.Version = "0.1.0-beta.1"`) so API/CLI versions stay plain SemVer; clients add the `v` prefix for display.
+
 ---
 
 ## 7. Keeping Documentation Up to Date
