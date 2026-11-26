@@ -53,3 +53,52 @@ func TestParseLocalNFO(t *testing.T) {
 		t.Fatalf("expected overview and tagline to be populated")
 	}
 }
+
+func TestParseLocalNFO_ParentTVShowAndEpisodeMerge(t *testing.T) {
+	showDir := t.TempDir()
+	seasonDir := filepath.Join(showDir, "Season 01")
+	if err := os.MkdirAll(seasonDir, 0o755); err != nil {
+		t.Fatalf("mkdir season: %v", err)
+	}
+
+	tvshowNFO := `<?xml version="1.0" encoding="UTF-8"?>
+<tvshow>
+  <title>The Expanse</title>
+  <mpaa>TV-14</mpaa>
+  <genre>Sci-Fi</genre>
+  <studio>Syfy</studio>
+  <uniqueid type="tmdb">63639</uniqueid>
+  <uniqueid type="imdb">tt3230854</uniqueid>
+</tvshow>`
+	if err := os.WriteFile(filepath.Join(showDir, "tvshow.nfo"), []byte(tvshowNFO), 0o644); err != nil {
+		t.Fatalf("write tvshow.nfo: %v", err)
+	}
+
+	// Episode with no own .nfo inherits series identity from parent tvshow.nfo without clobbering episode title.
+	ep1 := filepath.Join(seasonDir, "The Expanse - S01E01.mkv")
+	info1, ok := ParseLocalNFO(ep1)
+	if !ok {
+		t.Fatal("expected ParseLocalNFO to find parent tvshow.nfo")
+	}
+	if info1.Title != "" || info1.SeriesTitle != "The Expanse" || info1.TMDBID != "63639" || info1.IMDBID != "tt3230854" {
+		t.Fatalf("unexpected parent tvshow.nfo result: %+v", info1)
+	}
+
+	// Episode with own .nfo keeps episode title/plot and inherits missing TMDB/IMDb IDs from parent tvshow.nfo.
+	ep2 := filepath.Join(seasonDir, "The Expanse - S01E04.mkv")
+	ep2NFO := `<?xml version="1.0" encoding="UTF-8"?>
+<episodedetails>
+  <title>CQB</title>
+  <plot>The Donnager comes under attack.</plot>
+</episodedetails>`
+	if err := os.WriteFile(filepath.Join(seasonDir, "The Expanse - S01E04.nfo"), []byte(ep2NFO), 0o644); err != nil {
+		t.Fatalf("write ep2 nfo: %v", err)
+	}
+	info2, ok := ParseLocalNFO(ep2)
+	if !ok {
+		t.Fatal("expected ParseLocalNFO to parse episode nfo")
+	}
+	if info2.Title != "CQB" || info2.SeriesTitle != "The Expanse" || info2.TMDBID != "63639" || info2.IMDBID != "tt3230854" {
+		t.Fatalf("unexpected merged episode nfo: %+v", info2)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // ErrArtworkNotFound indicates that an upstream artwork asset does not exist (HTTP 404)
@@ -167,7 +169,7 @@ func (c *TMDBClient) enrichMovie(ctx context.Context, itemID, title string, year
 		return EnrichedInfo{}, nil
 	}
 
-	movieID := pickBestTMDBCandidate(searchRes.Results, preferAnime)
+	movieID := pickBestTMDBCandidate(searchRes.Results, title, year, preferAnime)
 	return c.enrichMovieByID(ctx, itemID, movieID, false)
 }
 
@@ -512,48 +514,200 @@ func (c *TMDBClient) enrichEpisodeWithShow(ctx context.Context, itemID string, s
 
 type tmdbSearchCandidate struct {
 	ID               int      `json:"id"`
+	Title            string   `json:"title"`
+	OriginalTitle    string   `json:"original_title"`
+	Name             string   `json:"name"`
+	OriginalName     string   `json:"original_name"`
+	ReleaseDate      string   `json:"release_date"`
+	FirstAirDate     string   `json:"first_air_date"`
+	Overview         string   `json:"overview"`
+	PosterPath       string   `json:"poster_path"`
+	Popularity       float64  `json:"popularity"`
+	VoteCount        int      `json:"vote_count"`
 	GenreIDs         []int    `json:"genre_ids"`
 	OriginCountry    []string `json:"origin_country"`
 	OriginalLanguage string   `json:"original_language"`
 }
 
-func pickBestTMDBCandidate(results []tmdbSearchCandidate, preferAnime bool) int {
+func pickBestTMDBCandidate(results []tmdbSearchCandidate, queryTitle string, year *int, preferAnime bool) int {
 	if len(results) == 0 {
 		return 0
 	}
-	if !preferAnime {
-		return results[0].ID
-	}
+	normQuery := normalizeMatchTitle(queryTitle)
+	normQueryNoArticle := stripLeadingArticle(normQuery)
+	queryTokens := matchTokens(normQuery)
+
 	bestID := results[0].ID
-	bestScore := -1
-	for _, r := range results {
-		score := 0
-		hasAnimation := false
-		for _, g := range r.GenreIDs {
-			if g == 16 { // TMDB Animation genre
-				hasAnimation = true
-				score += 10
-				break
+	bestScore := math.Inf(-1)
+
+	for i, r := range results {
+		score := -float64(i) * 0.25 // gentle tiebreaker preserving TMDB order
+
+		// 1. Title similarity (best of localized title/name vs original title/name).
+		if normQuery != "" {
+			titleScore := 0.0
+			for _, candRaw := range []string{r.Title, r.Name, r.OriginalTitle, r.OriginalName} {
+				cand := normalizeMatchTitle(candRaw)
+				if cand == "" {
+					continue
+				}
+				var s float64
+				switch {
+				case cand == normQuery:
+					s = 100
+				case normQueryNoArticle != "" && stripLeadingArticle(cand) == normQueryNoArticle:
+					s = 92
+				default:
+					candTokens := matchTokens(cand)
+					s = tokenDiceSimilarity(queryTokens, candTokens) * 65
+					if strings.HasPrefix(cand, normQuery) || strings.HasPrefix(normQuery, cand) {
+						s += 10
+					}
+				}
+				if s > titleScore {
+					titleScore = s
+				}
+			}
+			score += titleScore
+		}
+
+		// 2. Release / first-air year proximity.
+		if year != nil && *year > 0 {
+			candYear := parseTMDBCandidateYear(r.ReleaseDate, r.FirstAirDate)
+			if candYear > 0 {
+				diff := candYear - *year
+				if diff < 0 {
+					diff = -diff
+				}
+				switch {
+				case diff == 0:
+					score += 50
+				case diff == 1:
+					score += 25
+				case diff == 2:
+					score += 0
+				default:
+					pen := float64(diff) * 3
+					if pen > 40 {
+						pen = 40
+					}
+					score -= pen
+				}
+			} else {
+				score -= 10
 			}
 		}
-		if strings.EqualFold(r.OriginalLanguage, "ja") {
-			score += 6
+
+		// 3. Popularity / vote-count confidence tiebreaker so real releases beat 0-vote shorts/homonyms.
+		if r.VoteCount > 0 {
+			score += math.Log10(float64(r.VoteCount)+1) * 8
 		}
-		for _, c := range r.OriginCountry {
-			if strings.EqualFold(c, "JP") {
-				score += 4
-				break
+		if r.Popularity > 0 {
+			popBoost := math.Log10(r.Popularity+1) * 4
+			if popBoost > 10 {
+				popBoost = 10
+			}
+			score += popBoost
+		}
+		if r.PosterPath != "" {
+			score += 4
+		}
+		if r.Overview != "" {
+			score += 2
+		}
+
+		// 4. Anime library preference: strongly favor Animation (16) + Japanese origin/language.
+		if preferAnime {
+			for _, g := range r.GenreIDs {
+				if g == 16 {
+					score += 60
+					break
+				}
+			}
+			if strings.EqualFold(r.OriginalLanguage, "ja") {
+				score += 30
+			}
+			for _, c := range r.OriginCountry {
+				if strings.EqualFold(c, "JP") {
+					score += 20
+					break
+				}
 			}
 		}
-		if hasAnimation && score > bestScore {
-			bestScore = score
-			bestID = r.ID
-		} else if bestScore < 0 && score > 0 {
+
+		if score > bestScore {
 			bestScore = score
 			bestID = r.ID
 		}
 	}
 	return bestID
+}
+
+func parseTMDBCandidateYear(releaseDate, firstAirDate string) int {
+	for _, d := range []string{releaseDate, firstAirDate} {
+		d = strings.TrimSpace(d)
+		if len(d) >= 4 {
+			if y, err := strconv.Atoi(d[:4]); err == nil && y > 1880 && y < 2200 {
+				return y
+			}
+		}
+	}
+	return 0
+}
+
+func normalizeMatchTitle(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "&", " and ")
+	var b strings.Builder
+	b.Grow(len(s))
+	lastSpace := true
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			lastSpace = false
+		} else if !lastSpace {
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func stripLeadingArticle(norm string) string {
+	for _, prefix := range []string{"the ", "a ", "an "} {
+		if strings.HasPrefix(norm, prefix) {
+			return strings.TrimSpace(norm[len(prefix):])
+		}
+	}
+	return norm
+}
+
+func matchTokens(norm string) map[string]struct{} {
+	fields := strings.Fields(norm)
+	if len(fields) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		set[f] = struct{}{}
+	}
+	return set
+}
+
+func tokenDiceSimilarity(a, b map[string]struct{}) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	overlap := 0
+	for k := range a {
+		if _, ok := b[k]; ok {
+			overlap++
+		}
+	}
+	return (2.0 * float64(overlap)) / float64(len(a)+len(b))
 }
 
 func mapAbsoluteToTMDBSeason(seasons []tmdbSeasonMeta, absoluteEp int) (int, int, bool) {
@@ -609,7 +763,7 @@ func (c *TMDBClient) resolveTVShow(ctx context.Context, seriesTitle string, year
 		return nil, nil
 	}
 
-	tvID := pickBestTMDBCandidate(searchRes.Results, preferAnime)
+	tvID := pickBestTMDBCandidate(searchRes.Results, seriesTitle, year, preferAnime)
 	show, err := c.fetchTVShowByID(ctx, tvID)
 	if err != nil || show == nil {
 		return nil, err

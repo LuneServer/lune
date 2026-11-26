@@ -251,3 +251,22 @@ func TestDiscoverSubtitles_ASSAndSigns(t *testing.T) {
 		t.Fatalf("expected Signs & Songs forced track, got %+v", tracks)
 	}
 }
+
+func TestParseMediaPath_ExternalIDTags(t *testing.T) {
+	movieRoot := filepath.Join(t.TempDir(), "movies")
+	m1 := ParseMediaPath(movieRoot, filepath.Join(movieRoot, "Dune (2021) {tmdb-438631}", "Dune (2021) {tmdb-438631}.mkv"), "movies")
+	if m1.Title != "Dune" || m1.Year == nil || *m1.Year != 2021 || m1.TMDBID != "438631" {
+		t.Fatalf("unexpected curly tmdb parse: %+v", m1)
+	}
+
+	m2 := ParseMediaPath(movieRoot, filepath.Join(movieRoot, "[tmdbid-129] Spirited Away (2001) {imdb-tt0245429}.mkv"), "movies")
+	if m2.Title != "Spirited Away" || m2.TMDBID != "129" || m2.IMDBID != "tt0245429" || m2.ReleaseGroup != "" {
+		t.Fatalf("unexpected bracket tmdbid + imdb parse: %+v", m2)
+	}
+
+	showRoot := filepath.Join(t.TempDir(), "shows")
+	ep := ParseMediaPath(showRoot, filepath.Join(showRoot, "The Expanse (2015) [tmdbid-63639]", "Season 01", "S01E04 - CQB.mkv"), "shows")
+	if ep.SeriesTitle != "The Expanse" || ep.TMDBID != "63639" || ep.SeasonNumber == nil || *ep.SeasonNumber != 1 || ep.EpisodeNumber == nil || *ep.EpisodeNumber != 4 {
+		t.Fatalf("unexpected series folder tmdbid inheritance: %+v", ep)
+	}
+}

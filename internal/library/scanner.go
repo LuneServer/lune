@@ -289,11 +289,12 @@ func (s *Service) beginScan(libraryID string) (ScanStatus, error) {
 }
 
 type discoveredFile struct {
-	path  string
-	size  int64
-	mtime int64
-	isNew bool
-	id    string
+	path           string
+	size           int64
+	mtime          int64
+	isNew          bool
+	id             string
+	existingTMDBID string
 }
 
 func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) error {
@@ -352,7 +353,7 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 				return nil
 			}
 			toProcess = append(toProcess, discoveredFile{
-				path: path, size: info.Size(), mtime: mtime, isNew: false, id: fp.ID,
+				path: path, size: info.Size(), mtime: mtime, isNew: false, id: fp.ID, existingTMDBID: fp.TMDBID,
 			})
 			return nil
 		}
@@ -566,6 +567,8 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 		ChaptersJSON:          chaptersJSON,
 		PosterPath:            parsed.PosterPath,
 		BackdropPath:          parsed.BackdropPath,
+		TMDBID:                parsed.TMDBID,
+		IMDBID:                parsed.IMDBID,
 		GenresJSON:            "[]",
 		DirectorsJSON:         "[]",
 		WritersJSON:           "[]",
@@ -574,11 +577,14 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 		ProbedAt:              probedAt,
 	}
 
-	// 1. Offline local NFO sidecar enrichment (Kodi/Radarr/Sonarr XML).
+	// 1. Offline local NFO sidecar enrichment (Kodi/Radarr/Sonarr XML, including parent tvshow.nfo).
 	if nfo, ok := metadata.ParseLocalNFO(job.path); ok {
 		if nfo.Title != "" {
 			item.Title = nfo.Title
 			item.SortTitle = makeSortTitle(nfo.Title)
+		}
+		if nfo.SeriesTitle != "" && item.Kind == "episode" && item.SeriesTitle == "" {
+			item.SeriesTitle = nfo.SeriesTitle
 		}
 		if nfo.OriginalTitle != "" {
 			item.OriginalTitle = nfo.OriginalTitle
@@ -591,8 +597,12 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 		item.Rating = nfo.Rating
 		item.ContentRating = nfo.ContentRating
 		item.ReleaseDate = nfo.ReleaseDate
-		item.TMDBID = nfo.TMDBID
-		item.IMDBID = nfo.IMDBID
+		if item.TMDBID == "" && nfo.TMDBID != "" {
+			item.TMDBID = nfo.TMDBID
+		}
+		if item.IMDBID == "" && nfo.IMDBID != "" {
+			item.IMDBID = nfo.IMDBID
+		}
 		if len(nfo.Genres) > 0 {
 			if gb, err := json.Marshal(nfo.Genres); err == nil {
 				item.GenresJSON = string(gb)
@@ -620,6 +630,12 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 		}
 	}
 
+	// Preserve an existing TMDB ID (e.g. from a manual admin Identify/Re-Match) across re-scans
+	// unless overridden by a path ID tag or local .nfo sidecar.
+	if item.TMDBID == "" && job.existingTMDBID != "" {
+		item.TMDBID = job.existingTMDBID
+	}
+
 	// 2. Optional remote enricher (TMDB) when configured.
 	if item.Kind != "movie" && item.Kind != "episode" {
 		item.MetadataVersion = CurrentMetadataVersion
@@ -630,9 +646,12 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 				err    error
 			)
 			animeEnricher, hasAnime := s.enricher.(metadata.AnimeEnricher)
+			searchEnricher, hasSearch := s.enricher.(metadata.SearchEnricher)
 			switch item.Kind {
 			case "movie":
-				if lib.Kind == "anime" && hasAnime {
+				if item.TMDBID != "" && hasSearch {
+					remote, err = searchEnricher.EnrichMovieByTMDBID(ctx, item.ID, item.TMDBID)
+				} else if lib.Kind == "anime" && hasAnime {
 					remote, err = animeEnricher.EnrichAnimeMovie(ctx, item.ID, item.Title, item.Year)
 				} else {
 					remote, err = s.enricher.EnrichMovie(ctx, item.ID, item.Title, item.Year)
@@ -648,7 +667,9 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 				if item.AbsoluteEpisodeNumber != nil {
 					absEp = *item.AbsoluteEpisodeNumber
 				}
-				if lib.Kind == "anime" && hasAnime {
+				if item.TMDBID != "" && hasSearch {
+					remote, err = searchEnricher.EnrichEpisodeByTMDBID(ctx, item.ID, item.TMDBID, season, episode, absEp, lib.Kind == "anime")
+				} else if lib.Kind == "anime" && hasAnime {
 					remote, err = animeEnricher.EnrichAnimeEpisode(ctx, item.ID, item.SeriesTitle, season, episode, absEp, item.Year)
 				} else {
 					remote, err = s.enricher.EnrichEpisode(ctx, item.ID, item.SeriesTitle, season, episode, item.Year)

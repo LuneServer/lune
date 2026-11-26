@@ -319,3 +319,47 @@ func TestTMDBClient_FetchPersonPhotoResilience(t *testing.T) {
 		t.Fatalf("expected ErrArtworkNotFound for invalid path, got %v", err)
 	}
 }
+
+func TestPickBestTMDBCandidate_Scoring(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+
+	// 1. Exact year beats older remake even when older remake appears first.
+	duneResults := []tmdbSearchCandidate{
+		{ID: 841, Title: "Dune", ReleaseDate: "1984-12-14", VoteCount: 3000, Popularity: 40, PosterPath: "/old.jpg", Overview: "1984"},
+		{ID: 438631, Title: "Dune", ReleaseDate: "2021-09-15", VoteCount: 11000, Popularity: 80, PosterPath: "/new.jpg", Overview: "2021"},
+	}
+	if got := pickBestTMDBCandidate(duneResults, "Dune", intPtr(2021), false); got != 438631 {
+		t.Fatalf("expected Dune (2021) ID 438631, got %d", got)
+	}
+	if got := pickBestTMDBCandidate(duneResults, "Dune", intPtr(1984), false); got != 841 {
+		t.Fatalf("expected Dune (1984) ID 841, got %d", got)
+	}
+
+	// 2. Without year, exact title + real vote count beats 0-vote obscure homonym and featurette.
+	batmanResults := []tmdbSearchCandidate{
+		{ID: 999999, Title: "The Batman: Behind the Scenes", ReleaseDate: "2022-03-01", VoteCount: 3, Popularity: 1},
+		{ID: 888888, Title: "The Batman", ReleaseDate: "", VoteCount: 0, Popularity: 0.5},
+		{ID: 414906, Title: "The Batman", ReleaseDate: "2022-03-01", VoteCount: 9500, Popularity: 90, PosterPath: "/bat.jpg", Overview: "Batman"},
+	}
+	if got := pickBestTMDBCandidate(batmanResults, "The Batman", nil, false); got != 414906 {
+		t.Fatalf("expected The Batman ID 414906, got %d", got)
+	}
+
+	// 3. Normalized title (& vs and, punctuation) + +/-1 year festival offset beats mismatched sequel.
+	normResults := []tmdbSearchCandidate{
+		{ID: 1, Title: "Fast & Furious Presents: Hobbs & Shaw 2", ReleaseDate: "2020-01-01", VoteCount: 50},
+		{ID: 2, Title: "Fast & Furious", ReleaseDate: "2009-04-02", VoteCount: 7000, Popularity: 50, PosterPath: "/ff.jpg", Overview: "Cars"},
+	}
+	if got := pickBestTMDBCandidate(normResults, "Fast and Furious", intPtr(2010), false); got != 2 {
+		t.Fatalf("expected Fast & Furious ID 2, got %d", got)
+	}
+
+	// 4. Anime library still prefers Japanese Animation (16) over live-action with the same title & year.
+	animeResults := []tmdbSearchCandidate{
+		{ID: 100, Name: "One Piece", FirstAirDate: "2023-08-31", VoteCount: 4000, Popularity: 90, GenreIDs: []int{10759, 10765}, OriginCountry: []string{"US"}, OriginalLanguage: "en"},
+		{ID: 37854, Name: "One Piece", FirstAirDate: "1999-10-20", VoteCount: 4500, Popularity: 120, GenreIDs: []int{16, 10759}, OriginCountry: []string{"JP"}, OriginalLanguage: "ja"},
+	}
+	if got := pickBestTMDBCandidate(animeResults, "One Piece", nil, true); got != 37854 {
+		t.Fatalf("expected anime One Piece ID 37854, got %d", got)
+	}
+}

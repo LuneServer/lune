@@ -75,6 +75,7 @@ type MediaFileFingerprint struct {
 	FileSize        int64
 	FileMtime       int64
 	MetadataVersion int
+	TMDBID          string
 }
 
 type MediaListFilter struct {
@@ -189,7 +190,7 @@ func (s *Store) DeleteLibrary(ctx context.Context, id string) error {
 
 func (s *Store) ListLibraryFingerprints(ctx context.Context, libraryID string) (map[string]MediaFileFingerprint, error) {
 	rows, err := s.reader.QueryContext(ctx, `
-		SELECT id, file_path, file_size, file_mtime, metadata_version
+		SELECT id, file_path, file_size, file_mtime, metadata_version, tmdb_id
 		FROM media_items
 		WHERE library_id = ?
 	`, libraryID)
@@ -201,7 +202,7 @@ func (s *Store) ListLibraryFingerprints(ctx context.Context, libraryID string) (
 	out := make(map[string]MediaFileFingerprint)
 	for rows.Next() {
 		var fp MediaFileFingerprint
-		if err := rows.Scan(&fp.ID, &fp.FilePath, &fp.FileSize, &fp.FileMtime, &fp.MetadataVersion); err != nil {
+		if err := rows.Scan(&fp.ID, &fp.FilePath, &fp.FileSize, &fp.FileMtime, &fp.MetadataVersion, &fp.TMDBID); err != nil {
 			return nil, err
 		}
 		out[fp.FilePath] = fp
