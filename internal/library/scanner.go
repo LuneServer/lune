@@ -177,7 +177,9 @@ func (s *Service) DeleteLibrary(ctx context.Context, id string) error {
 	}
 	if err == nil {
 		s.mu.Lock()
-		delete(s.scans, id)
+		if st, ok := s.scans[id]; ok && !st.Running {
+			delete(s.scans, id)
+		}
 		s.mu.Unlock()
 	}
 	s.watcher.NotifyLibrariesChanged()
