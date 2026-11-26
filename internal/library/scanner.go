@@ -229,6 +229,29 @@ func (s *Service) GetPersonPhoto(ctx context.Context, filename string) (string, 
 	return p, nil
 }
 
+// ResolveArtwork ensures a media item's poster or backdrop file exists on disk,
+// lazily fetching sharded TMDB artwork (such as episode stills or backdrops) on first access.
+func (s *Service) ResolveArtwork(ctx context.Context, artPath string) (string, error) {
+	if artPath == "" {
+		return "", ErrNotFound
+	}
+	if info, err := os.Stat(artPath); err == nil && info.Size() > 0 {
+		return artPath, nil
+	}
+	fetcher, ok := s.enricher.(metadata.LazyArtFetcher)
+	if !ok || fetcher == nil {
+		return "", ErrNotFound
+	}
+	p, err := fetcher.EnsureArtwork(ctx, artPath)
+	if err != nil {
+		if errors.Is(err, metadata.ErrArtworkNotFound) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return p, nil
+}
+
 // GetScanStatus returns the current or most recent scan state for a library.
 func (s *Service) GetScanStatus(libraryID string) ScanStatus {
 	s.mu.Lock()

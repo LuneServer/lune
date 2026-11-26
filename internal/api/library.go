@@ -580,8 +580,22 @@ func registerLibraryRoutes(r chi.Router, api huma.API, libSvc *library.Service, 
 			http.NotFound(w, req)
 			return
 		}
+		resolvedPath, err := libSvc.ResolveArtwork(req.Context(), artPath)
+		if err != nil {
+			switch {
+			case errors.Is(err, library.ErrNotFound):
+				http.NotFound(w, req)
+			case errors.Is(err, context.DeadlineExceeded):
+				w.Header().Set("Cache-Control", "no-store")
+				http.Error(w, "upstream artwork timeout", http.StatusGatewayTimeout)
+			default:
+				w.Header().Set("Cache-Control", "no-store")
+				http.Error(w, "artwork temporarily unavailable", http.StatusServiceUnavailable)
+			}
+			return
+		}
 		w.Header().Set("Cache-Control", "private, max-age=86400")
-		http.ServeFile(w, req, artPath)
+		http.ServeFile(w, req, resolvedPath)
 	})
 
 	// Authenticated lazily-cached cast/crew headshot endpoint.
