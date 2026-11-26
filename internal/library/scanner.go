@@ -239,6 +239,21 @@ func (s *Service) GetScanStatus(libraryID string) ScanStatus {
 	return ScanStatus{LibraryID: libraryID}
 }
 
+// HasRunningScan reports whether any library currently has an active scan in progress.
+func (s *Service) HasRunningScan() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.scans {
+		if st.Running {
+			return true
+		}
+	}
+	return false
+}
+
 // StartScanAsync launches a background library scan.
 func (s *Service) StartScanAsync(ctx context.Context, libraryID string, force bool) (ScanStatus, error) {
 	lib, err := s.GetLibrary(ctx, libraryID)
