@@ -56,7 +56,6 @@ const (
 	trickplayManifestVersion  = 3 // v3: black bars cropped, tiles fit within a 16:9 box
 	trickplayColumns          = 10
 	trickplayRows             = 10
-	maxTrickplayItemsPerRun   = 50
 	trickplayMaxActivePerItem = 90 * time.Minute // CPU-time budget per FFmpeg call (paused time excluded)
 	// Tiles fit inside width x (width*9/16): letterboxed (cropped) titles get shorter tiles and
 	// pillarboxed 4:3 titles narrower ones, so cropping never makes a tile larger than 16:9.
@@ -175,9 +174,6 @@ func (s *Service) generateTrickplay(ctx context.Context, cfg Config, onProgress 
 		}
 		if trickplayFailedFor(itemDir, item, cfg, enc.Format) {
 			res.Unextractable++
-			continue
-		}
-		if len(work) >= maxTrickplayItemsPerRun {
 			continue
 		}
 		if _, err := os.Stat(item.FilePath); err != nil {

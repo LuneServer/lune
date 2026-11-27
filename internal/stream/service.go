@@ -209,6 +209,33 @@ func (s *Service) ActiveTranscodeDirs() map[string]struct{} {
 	return s.transcoder.ActiveDirs()
 }
 
+// PlaybackActivityWindow is how recently a playback session must have been seen (stream request,
+// HLS fetch or progress heartbeat) to count as active playback for background-work throttling.
+// Clients report progress about every 10s while playing; AVPlayer direct play can buffer for tens
+// of seconds between range requests, so the window spans several missed heartbeats.
+const PlaybackActivityWindow = 45 * time.Second
+
+// HasActivePlayback reports whether any client is currently playing media: a live FFmpeg HLS
+// session, or any negotiated session (direct, remux or transcode) seen within
+// PlaybackActivityWindow. Direct play has no FFmpeg process, so it is only visible here.
+func (s *Service) HasActivePlayback() bool {
+	if s == nil {
+		return false
+	}
+	if s.transcoder != nil && len(s.transcoder.ActiveDirs()) > 0 {
+		return true
+	}
+	cutoff := s.now().UTC().Add(-PlaybackActivityWindow)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.active {
+		if st.LastSeenAt.After(cutoff) {
+			return true
+		}
+	}
+	return false
+}
+
 // UpdateStreamingConfig validates, persists, and hot-reloads streaming/transcoding limits.
 func (s *Service) UpdateStreamingConfig(ctx context.Context, actor store.User, cfg StreamingConfig, clientIP string) (StreamingConfig, error) {
 	if cfg.IdleTimeoutMinutes == 0 {

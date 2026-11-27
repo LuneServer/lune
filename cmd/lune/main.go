@@ -120,6 +120,7 @@ func main() {
 		DataDir:             cfg.DataDir,
 		IsScanRunning:       libSvc.HasRunningScan,
 		ActiveTranscodeDirs: streamSvc.ActiveTranscodeDirs,
+		IsPlaybackActive:    streamSvc.HasActivePlayback,
 		Logger:              logger,
 	})
 	go maintSvc.Run(ctx)

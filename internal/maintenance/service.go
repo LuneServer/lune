@@ -188,7 +188,26 @@ type RunReport struct {
 	TrickplayFailed               int       `json:"trickplay_failed,omitempty"`
 	TrickplayBytes                int64     `json:"trickplay_bytes,omitempty"`
 	Errors                        []string  `json:"errors,omitempty"`
+	// Outcome summarizes the pass: "completed", "partial" (some tasks skipped or errored),
+	// "skipped" (nothing requested could run) or "canceled".
+	Outcome string `json:"outcome,omitempty"`
+	// Skipped lists tasks that did not run (or stopped early) and why.
+	Skipped []SkippedTask `json:"skipped,omitempty"`
 }
+
+// SkippedTask records a housekeeping task that could not run or yielded part-way, with a
+// human-readable reason (e.g. "Library scan in progress").
+type SkippedTask struct {
+	Task   string `json:"task"`
+	Reason string `json:"reason"`
+}
+
+const (
+	OutcomeCompleted = "completed"
+	OutcomePartial   = "partial"
+	OutcomeSkipped   = "skipped"
+	OutcomeCanceled  = "canceled"
+)
 
 // Status is the full maintenance state exposed to the Admin Console.
 type Status struct {
@@ -218,7 +237,9 @@ type Options struct {
 	DataDir             string
 	IsScanRunning       func() bool
 	ActiveTranscodeDirs func() map[string]struct{}
-	Logger              *slog.Logger
+	// IsPlaybackActive reports any client playback (direct play included) seen recently.
+	IsPlaybackActive func() bool
+	Logger           *slog.Logger
 }
 
 // Service manages periodic and on-demand housekeeping with live-editable configuration.
@@ -228,6 +249,7 @@ type Service struct {
 	ffmpegBin           string
 	isScanRunning       func() bool
 	activeTranscodeDirs func() map[string]struct{}
+	isPlaybackActive    func() bool
 	logger              *slog.Logger
 
 	reconfigCh chan struct{}
@@ -252,6 +274,8 @@ type Service struct {
 	lastRun         *RunReport
 	lastScheduledAt time.Time
 	nextRunAt       *time.Time
+	// lastBusyReason is the most recent reason a yielding task found the server busy.
+	lastBusyReason string
 }
 
 // NewService constructs a maintenance service and hydrates saved config/last-run state from SQLite.
@@ -267,6 +291,7 @@ func NewService(ctx context.Context, s *store.Store, opts Options) *Service {
 		ffmpegBin:           ffmpegBin,
 		isScanRunning:       opts.IsScanRunning,
 		activeTranscodeDirs: opts.ActiveTranscodeDirs,
+		isPlaybackActive:    opts.IsPlaybackActive,
 		logger:              logger,
 		reconfigCh:          make(chan struct{}, 1),
 		cfg:                 DefaultConfig(),
@@ -544,6 +569,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 	}
 	s.running = true
 	s.cancelRun = cancel
+	s.lastBusyReason = ""
 	cfg := s.cfg
 	s.mu.Unlock()
 
@@ -568,12 +594,57 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		}
 	}()
 
-	runArtwork := (task == "" && cfg.CleanupOrphanedArtwork || task == TaskArtwork) && s.dataDir != "" && s.store != nil
-	runTranscode := (task == "" && cfg.CleanupTranscodeCache || task == TaskTranscodeCache) && s.dataDir != ""
-	runAudit := (task == "" && cfg.PruneAuditLogs || task == TaskAudit) && s.store != nil
-	runChapters := (task == "" && cfg.GenerateChapterThumbnails || task == TaskChapterThumbnails) && s.dataDir != "" && s.store != nil && s.ffmpegBin != ""
-	runTrickplay := (task == "" && cfg.GenerateTrickplay || task == TaskTrickplay) && s.dataDir != "" && s.store != nil && s.ffmpegBin != ""
-	runOptimize := (task == "" && cfg.OptimizeDatabase || task == TaskOptimizeDB) && s.store != nil
+	wantArtwork := task == "" && cfg.CleanupOrphanedArtwork || task == TaskArtwork
+	wantTranscode := task == "" && cfg.CleanupTranscodeCache || task == TaskTranscodeCache
+	wantAudit := task == "" && cfg.PruneAuditLogs || task == TaskAudit
+	wantChapters := task == "" && cfg.GenerateChapterThumbnails || task == TaskChapterThumbnails
+	wantTrickplay := task == "" && cfg.GenerateTrickplay || task == TaskTrickplay
+	wantOptimize := task == "" && cfg.OptimizeDatabase || task == TaskOptimizeDB
+
+	runArtwork := wantArtwork && s.dataDir != "" && s.store != nil
+	runTranscode := wantTranscode && s.dataDir != ""
+	runAudit := wantAudit && s.store != nil
+	runChapters := wantChapters && s.dataDir != "" && s.store != nil && s.ffmpegBin != ""
+	runTrickplay := wantTrickplay && s.dataDir != "" && s.store != nil && s.ffmpegBin != ""
+	runOptimize := wantOptimize && s.store != nil
+
+	var skipped []SkippedTask
+	skip := func(name, reason string) {
+		skipped = append(skipped, SkippedTask{Task: name, Reason: reason})
+	}
+	unavailable := func(name string, needsFFmpeg bool) {
+		if needsFFmpeg && s.ffmpegBin == "" {
+			skip(name, "FFmpeg not available")
+			return
+		}
+		skip(name, "Not available on this server")
+	}
+	for _, t := range []struct {
+		name        string
+		want, run   bool
+		needsFFmpeg bool
+	}{
+		{TaskArtwork, wantArtwork, runArtwork, false},
+		{TaskTranscodeCache, wantTranscode, runTranscode, false},
+		{TaskAudit, wantAudit, runAudit, false},
+		{TaskChapterThumbnails, wantChapters, runChapters, true},
+		{TaskTrickplay, wantTrickplay, runTrickplay, true},
+		{TaskOptimizeDB, wantOptimize, runOptimize, false},
+	} {
+		if t.want && !t.run {
+			unavailable(t.name, t.needsFFmpeg)
+		}
+	}
+	// ran counts tasks that did at least part of their work.
+	ran := 0
+	busyReason := func() string {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.lastBusyReason != "" {
+			return s.lastBusyReason
+		}
+		return "Server busy"
+	}
 
 	totalSteps := 0
 	if runArtwork {
@@ -640,7 +711,9 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		setProgress("artwork", "Cleaning orphaned artwork", "", 0, 0, 0)
 		if s.isScanRunning != nil && s.isScanRunning() {
 			report.SkippedArtworkScanBusy = true
+			skip(TaskArtwork, BusyReasonScan)
 		} else {
+			ran++
 			removed, freed, err := s.cleanOrphanedArtwork(runCtx, started.Add(-time.Duration(cfg.ArtworkGraceHours)*time.Hour))
 			report.ArtworkFilesRemoved = removed
 			report.ArtworkBytesFreed = freed
@@ -657,6 +730,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		setProgress("transcode_cache", "Cleaning transcode & subtitle cache", "", 0, 0, 0)
 		subCutoff := started.Add(-time.Duration(cfg.SubtitleCacheDays) * 24 * time.Hour)
 		sessionCutoff := started.Add(-2 * time.Hour)
+		ran++
 		removed, freed, err := s.cleanTranscodeCache(sessionCutoff, subCutoff)
 		report.TranscodeItemsRemoved = removed
 		report.TranscodeBytesFreed = freed
@@ -671,6 +745,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		stepNum++
 		setProgress("audit", "Pruning old audit logs", "", 0, 0, 0)
 		cutoff := started.Add(-time.Duration(cfg.AuditRetentionDays) * 24 * time.Hour)
+		ran++
 		pruned, err := s.store.PruneAuditEventsBefore(runCtx, cutoff)
 		report.AuditEventsPruned = pruned
 		if err != nil && runCtx.Err() == nil {
@@ -679,7 +754,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		setProgress("audit", "Pruning old audit logs", "", 1, 1, 1)
 	}
 
-	// 4. Chapter still thumbnail generation (sequential, capped, yields to active scans/transcodes).
+	// 4. Chapter still thumbnail generation (sequential, whole backlog per run, yields to active scans/playback).
 	if runCtx.Err() == nil && runChapters {
 		stepNum++
 		setProgress("chapter_thumbnails", "Generating chapter stills", "Scanning chapter index…", 0, 0, 0)
@@ -696,6 +771,12 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		report.ChapterThumbnailsMissingFiles = res.MissingFiles
 		report.ChapterThumbnailsFailed = res.Unextractable
 		report.SkippedChaptersBusy = res.SkippedBusy && runCtx.Err() == nil
+		if report.SkippedChaptersBusy {
+			skip(TaskChapterThumbnails, busyReason())
+		}
+		if !report.SkippedChaptersBusy || res.Generated > 0 {
+			ran++
+		}
 		if err != nil && runCtx.Err() == nil {
 			report.Errors = append(report.Errors, "chapter thumbnails: "+err.Error())
 		}
@@ -719,6 +800,12 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		report.TrickplayFailed = res.Unextractable
 		report.TrickplayBytes = res.Bytes
 		report.SkippedTrickplayBusy = res.SkippedBusy && runCtx.Err() == nil
+		if report.SkippedTrickplayBusy {
+			skip(TaskTrickplay, busyReason())
+		}
+		if !report.SkippedTrickplayBusy || res.Generated > 0 {
+			ran++
+		}
 		if err != nil && runCtx.Err() == nil {
 			report.Errors = append(report.Errors, "trickplay: "+err.Error())
 		}
@@ -729,6 +816,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 	if runCtx.Err() == nil && runOptimize {
 		stepNum++
 		setProgress("optimize_db", "Optimizing SQLite database", "", 0, 0, 0)
+		ran++
 		optErr := s.store.Optimize(runCtx)
 		cpErr := s.store.CheckpointPassive(runCtx)
 		if optErr != nil && runCtx.Err() == nil {
@@ -745,6 +833,17 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 
 	if runCtx.Err() != nil {
 		report.Canceled = true
+	}
+	report.Skipped = skipped
+	switch {
+	case report.Canceled:
+		report.Outcome = OutcomeCanceled
+	case len(skipped) > 0 && ran == 0:
+		report.Outcome = OutcomeSkipped
+	case len(skipped) > 0:
+		report.Outcome = OutcomePartial
+	default:
+		report.Outcome = OutcomeCompleted
 	}
 
 	report.FinishedAt = time.Now().UTC()
@@ -779,6 +878,9 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 
 	s.logger.Info("maintenance housekeeping completed",
 		"trigger", trigger,
+		"task", task,
+		"outcome", report.Outcome,
+		"skipped", len(report.Skipped),
 		"duration_ms", report.DurationMS,
 		"artwork_removed", report.ArtworkFilesRemoved,
 		"transcode_removed", report.TranscodeItemsRemoved,
