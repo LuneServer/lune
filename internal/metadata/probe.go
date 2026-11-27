@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -41,11 +42,40 @@ type StreamInfo struct {
 
 // ChapterInfo describes a container chapter marker (commonly used in anime MKVs for OP/ED/Recap).
 type ChapterInfo struct {
-	Index   int    `json:"index"`
-	Title   string `json:"title,omitempty"`
-	StartMS int64  `json:"start_ms"`
-	EndMS   int64  `json:"end_ms"`
-	Kind    string `json:"kind"` // "intro" | "outro" | "recap" | "preview" | "chapter"
+	Index        int    `json:"index"`
+	Title        string `json:"title,omitempty"`
+	StartMS      int64  `json:"start_ms"`
+	EndMS        int64  `json:"end_ms"`
+	Kind         string `json:"kind"` // "intro" | "outro" | "recap" | "preview" | "chapter"
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+}
+
+// PopulateChapterThumbnails inspects <dataDir>/artwork/chapters/<itemID> with a single ReadDir
+// and populates ThumbnailURL on chapters whose <index>.jpg still image exists on disk.
+func PopulateChapterThumbnails(dataDir, itemID string, chapters []ChapterInfo) {
+	if dataDir == "" || itemID == "" || len(chapters) == 0 {
+		return
+	}
+	entries, err := os.ReadDir(filepath.Join(dataDir, "artwork", "chapters", itemID))
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	available := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		available[entry.Name()] = struct{}{}
+	}
+	for i := range chapters {
+		if chapters[i].Index < 0 {
+			continue
+		}
+		name := strconv.Itoa(chapters[i].Index) + ".jpg"
+		if _, ok := available[name]; ok {
+			chapters[i].ThumbnailURL = fmt.Sprintf("/api/v1/items/%s/artwork/chapters/%d", itemID, chapters[i].Index)
+		}
+	}
 }
 
 // ProbeResult summarizes container-level and stream-level technical metadata.

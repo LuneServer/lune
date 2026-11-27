@@ -68,12 +68,12 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 				EventType: "admin.maintenance_config_updated",
 				ActorID:   user.ID,
 				ClientIP:  clientIPFromContext(ctx),
-				Detail: fmt.Sprintf("enabled=%t interval=%dh time=%s artwork=%t(%dh) transcode=%t(%dd) audit=%t(%dd) db_opt=%t",
+				Detail: fmt.Sprintf("enabled=%t interval=%dh time=%s artwork=%t(%dh) transcode=%t(%dd) audit=%t(%dd) db_opt=%t chapters=%t",
 					in.Body.Enabled, in.Body.IntervalHours, in.Body.ScheduleTime,
 					in.Body.CleanupOrphanedArtwork, in.Body.ArtworkGraceHours,
 					in.Body.CleanupTranscodeCache, in.Body.SubtitleCacheDays,
 					in.Body.PruneAuditLogs, in.Body.AuditRetentionDays,
-					in.Body.OptimizeDatabase),
+					in.Body.OptimizeDatabase, in.Body.GenerateChapterThumbnails),
 			})
 		}
 		return &MaintenanceStatusResponse{Body: st}, nil
@@ -83,9 +83,11 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 		OperationID: "admin-run-maintenance",
 		Method:      http.MethodPost,
 		Path:        "/api/v1/admin/maintenance/run",
-		Summary:     "Run a housekeeping maintenance pass immediately",
+		Summary:     "Run a full housekeeping maintenance pass or a single task immediately",
 		Tags:        []string{"Admin"},
-	}, func(ctx context.Context, _ *struct{}) (*MaintenanceStatusResponse, error) {
+	}, func(ctx context.Context, in *struct {
+		Task string `query:"task" doc:"Optional single task to run: artwork, transcode_cache, audit, chapter_thumbnails, or optimize_db"`
+	}) (*MaintenanceStatusResponse, error) {
 		user, _, ok := currentPrincipal(ctx)
 		if !ok {
 			return nil, huma.Error401Unauthorized("authentication required")
@@ -93,20 +95,26 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 		if user.Role != "admin" {
 			return nil, huma.Error403Forbidden("admin privileges required")
 		}
-		st, err := maintSvc.RunNow(ctx)
+		st, err := maintSvc.RunTask(ctx, in.Task)
 		if err != nil {
 			if errors.Is(err, maintenance.ErrAlreadyRunning) {
 				return nil, huma.Error409Conflict("maintenance run already in progress")
+			}
+			if errors.Is(err, maintenance.ErrInvalidTask) {
+				return nil, huma.Error400BadRequest(err.Error())
 			}
 			return nil, huma.Error500InternalServerError("maintenance run failed", err)
 		}
 		if db != nil {
 			detail := "manual housekeeping completed"
 			if st.LastRun != nil {
-				detail = fmt.Sprintf("artwork=%d transcode=%d audit_pruned=%d db_opt=%t",
+				detail = fmt.Sprintf("task=%s canceled=%t artwork=%d transcode=%d audit_pruned=%d chapters=%d db_opt=%t",
+					in.Task,
+					st.LastRun.Canceled,
 					st.LastRun.ArtworkFilesRemoved,
 					st.LastRun.TranscodeItemsRemoved,
 					st.LastRun.AuditEventsPruned,
+					st.LastRun.ChapterThumbnailsGenerated,
 					st.LastRun.DatabaseOptimized)
 			}
 			_ = db.InsertAuditEvent(ctx, store.AuditEvent{
@@ -117,5 +125,31 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 			})
 		}
 		return &MaintenanceStatusResponse{Body: st}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "admin-cancel-maintenance",
+		Method:      http.MethodPost,
+		Path:        "/api/v1/admin/maintenance/cancel",
+		Summary:     "Cancel an in-progress housekeeping maintenance pass",
+		Tags:        []string{"Admin"},
+	}, func(ctx context.Context, _ *struct{}) (*MaintenanceStatusResponse, error) {
+		user, _, ok := currentPrincipal(ctx)
+		if !ok {
+			return nil, huma.Error401Unauthorized("authentication required")
+		}
+		if user.Role != "admin" {
+			return nil, huma.Error403Forbidden("admin privileges required")
+		}
+		canceled := maintSvc.CancelRun()
+		if canceled && db != nil {
+			_ = db.InsertAuditEvent(ctx, store.AuditEvent{
+				EventType: "admin.maintenance_canceled",
+				ActorID:   user.ID,
+				ClientIP:  clientIPFromContext(ctx),
+				Detail:    "maintenance run canceled by admin",
+			})
+		}
+		return &MaintenanceStatusResponse{Body: maintSvc.Status()}, nil
 	})
 }

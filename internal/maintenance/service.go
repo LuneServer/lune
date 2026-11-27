@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,35 +26,55 @@ const (
 var (
 	ErrAlreadyRunning = errors.New("maintenance run already in progress")
 	ErrInvalidConfig  = errors.New("invalid maintenance configuration")
+	ErrInvalidTask    = errors.New("invalid maintenance task")
 )
+
+const (
+	TaskArtwork           = "artwork"
+	TaskTranscodeCache    = "transcode_cache"
+	TaskAudit             = "audit"
+	TaskChapterThumbnails = "chapter_thumbnails"
+	TaskOptimizeDB        = "optimize_db"
+)
+
+func isValidTask(task string) bool {
+	switch task {
+	case "", TaskArtwork, TaskTranscodeCache, TaskAudit, TaskChapterThumbnails, TaskOptimizeDB:
+		return true
+	default:
+		return false
+	}
+}
 
 // Config controls periodic background housekeeping tasks and retention windows.
 type Config struct {
-	Enabled                bool   `json:"enabled"`
-	IntervalHours          int    `json:"interval_hours"`           // 1..720 (default 24)
-	ScheduleTime           string `json:"schedule_time"`            // Optional 24h local time "HH:MM" (default "03:00"; "" = rolling)
-	CleanupOrphanedArtwork bool   `json:"cleanup_orphaned_artwork"` // default true
-	ArtworkGraceHours      int    `json:"artwork_grace_hours"`      // 1..168 (default 24)
-	CleanupTranscodeCache  bool   `json:"cleanup_transcode_cache"`  // default true
-	SubtitleCacheDays      int    `json:"subtitle_cache_days"`      // 1..365 (default 30)
-	PruneAuditLogs         bool   `json:"prune_audit_logs"`         // default true
-	AuditRetentionDays     int    `json:"audit_retention_days"`     // 7..3650 (default 90)
-	OptimizeDatabase       bool   `json:"optimize_database"`        // default true
+	Enabled                   bool   `json:"enabled"`
+	IntervalHours             int    `json:"interval_hours"`              // 1..720 (default 24)
+	ScheduleTime              string `json:"schedule_time"`               // Optional 24h local time "HH:MM" (default "03:00"; "" = rolling)
+	CleanupOrphanedArtwork    bool   `json:"cleanup_orphaned_artwork"`    // default true
+	ArtworkGraceHours         int    `json:"artwork_grace_hours"`         // 1..168 (default 24)
+	CleanupTranscodeCache     bool   `json:"cleanup_transcode_cache"`     // default true
+	SubtitleCacheDays         int    `json:"subtitle_cache_days"`         // 1..365 (default 30)
+	PruneAuditLogs            bool   `json:"prune_audit_logs"`            // default true
+	AuditRetentionDays        int    `json:"audit_retention_days"`        // 7..3650 (default 90)
+	OptimizeDatabase          bool   `json:"optimize_database"`           // default true
+	GenerateChapterThumbnails bool   `json:"generate_chapter_thumbnails"` // default true
 }
 
 // DefaultConfig returns safe, conservative defaults for daily housekeeping at 03:00 local time.
 func DefaultConfig() Config {
 	return Config{
-		Enabled:                true,
-		IntervalHours:          24,
-		ScheduleTime:           "03:00",
-		CleanupOrphanedArtwork: true,
-		ArtworkGraceHours:      24,
-		CleanupTranscodeCache:  true,
-		SubtitleCacheDays:      30,
-		PruneAuditLogs:         true,
-		AuditRetentionDays:     90,
-		OptimizeDatabase:       true,
+		Enabled:                   true,
+		IntervalHours:             24,
+		ScheduleTime:              "03:00",
+		CleanupOrphanedArtwork:    true,
+		ArtworkGraceHours:         24,
+		CleanupTranscodeCache:     true,
+		SubtitleCacheDays:         30,
+		PruneAuditLogs:            true,
+		AuditRetentionDays:        90,
+		OptimizeDatabase:          true,
+		GenerateChapterThumbnails: true,
 	}
 }
 
@@ -97,29 +118,49 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// RunProgress reports live progress for an in-flight housekeeping pass.
+type RunProgress struct {
+	Stage      string `json:"stage"`
+	Label      string `json:"label"`
+	Detail     string `json:"detail,omitempty"`
+	Completed  int    `json:"completed"`
+	Total      int    `json:"total"`
+	Percent    int    `json:"percent"`
+	Step       int    `json:"step"`
+	TotalSteps int    `json:"total_steps"`
+}
+
 // RunReport summarizes the outcome of a single housekeeping pass.
 type RunReport struct {
-	StartedAt              time.Time `json:"started_at"`
-	FinishedAt             time.Time `json:"finished_at"`
-	DurationMS             int64     `json:"duration_ms"`
-	Trigger                string    `json:"trigger"` // "scheduled" | "manual"
-	SkippedArtworkScanBusy bool      `json:"skipped_artwork_scan_busy,omitempty"`
-	ArtworkFilesRemoved    int       `json:"artwork_files_removed"`
-	ArtworkBytesFreed      int64     `json:"artwork_bytes_freed"`
-	TranscodeItemsRemoved  int       `json:"transcode_items_removed"`
-	TranscodeBytesFreed    int64     `json:"transcode_bytes_freed"`
-	AuditEventsPruned      int64     `json:"audit_events_pruned"`
-	DatabaseOptimized      bool      `json:"database_optimized"`
-	Errors                 []string  `json:"errors,omitempty"`
+	StartedAt                     time.Time `json:"started_at"`
+	FinishedAt                    time.Time `json:"finished_at"`
+	DurationMS                    int64     `json:"duration_ms"`
+	Trigger                       string    `json:"trigger"` // "scheduled" | "manual"
+	Task                          string    `json:"task,omitempty"`
+	Canceled                      bool      `json:"canceled,omitempty"`
+	SkippedArtworkScanBusy        bool      `json:"skipped_artwork_scan_busy,omitempty"`
+	SkippedChaptersBusy           bool      `json:"skipped_chapters_busy,omitempty"`
+	ArtworkFilesRemoved           int       `json:"artwork_files_removed"`
+	ArtworkBytesFreed             int64     `json:"artwork_bytes_freed"`
+	TranscodeItemsRemoved         int       `json:"transcode_items_removed"`
+	TranscodeBytesFreed           int64     `json:"transcode_bytes_freed"`
+	AuditEventsPruned             int64     `json:"audit_events_pruned"`
+	DatabaseOptimized             bool      `json:"database_optimized"`
+	ChapterThumbnailsGenerated    int       `json:"chapter_thumbnails_generated"`
+	ChapterThumbnailsExisting     int       `json:"chapter_thumbnails_existing,omitempty"`
+	ChapterThumbnailsTotal        int       `json:"chapter_thumbnails_total,omitempty"`
+	ChapterThumbnailsMissingFiles int       `json:"chapter_thumbnails_missing_files,omitempty"`
+	Errors                        []string  `json:"errors,omitempty"`
 }
 
 // Status is the full maintenance state exposed to the Admin Console.
 type Status struct {
-	Config         Config     `json:"config"`
-	Running        bool       `json:"running"`
-	LastRun        *RunReport `json:"last_run,omitempty"`
-	NextRunAt      *time.Time `json:"next_run_at,omitempty"`
-	ServerTimezone string     `json:"server_timezone,omitempty"`
+	Config         Config       `json:"config"`
+	Running        bool         `json:"running"`
+	Progress       *RunProgress `json:"progress,omitempty"`
+	LastRun        *RunReport   `json:"last_run,omitempty"`
+	NextRunAt      *time.Time   `json:"next_run_at,omitempty"`
+	ServerTimezone string       `json:"server_timezone,omitempty"`
 }
 
 // Options injects runtime hooks used to guard housekeeping against active scans or streams.
@@ -134,6 +175,7 @@ type Options struct {
 type Service struct {
 	store               *store.Store
 	dataDir             string
+	ffmpegBin           string
 	isScanRunning       func() bool
 	activeTranscodeDirs func() map[string]struct{}
 	logger              *slog.Logger
@@ -144,6 +186,8 @@ type Service struct {
 	mu              sync.Mutex
 	cfg             Config
 	running         bool
+	cancelRun       context.CancelFunc
+	progress        *RunProgress
 	lastRun         *RunReport
 	lastScheduledAt time.Time
 	nextRunAt       *time.Time
@@ -155,9 +199,11 @@ func NewService(ctx context.Context, s *store.Store, opts Options) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	ffmpegBin, _ := exec.LookPath("ffmpeg")
 	svc := &Service{
 		store:               s,
 		dataDir:             opts.DataDir,
+		ffmpegBin:           ffmpegBin,
 		isScanRunning:       opts.IsScanRunning,
 		activeTranscodeDirs: opts.ActiveTranscodeDirs,
 		logger:              logger,
@@ -205,6 +251,10 @@ func (s *Service) Status() Status {
 		Config:         s.cfg,
 		Running:        s.running,
 		ServerTimezone: tzName,
+	}
+	if s.progress != nil {
+		p := *s.progress
+		out.Progress = &p
 	}
 	if s.lastRun != nil {
 		cp := *s.lastRun
@@ -291,7 +341,7 @@ func (s *Service) Run(ctx context.Context) {
 			timer.Stop()
 			continue
 		case <-timer.C:
-			_, err := s.runOnce(ctx, "scheduled")
+			_, err := s.runOnce(ctx, "scheduled", "")
 			if err != nil && !errors.Is(err, ErrAlreadyRunning) && ctx.Err() == nil {
 				s.logger.Warn("scheduled maintenance run failed", "error", err)
 			}
@@ -300,11 +350,41 @@ func (s *Service) Run(ctx context.Context) {
 }
 
 // RunNow triggers an immediate housekeeping pass synchronously and returns the updated Status.
+// It detaches from the caller's HTTP request context so browser navigation or refresh does not
+// abort an in-flight pass; callers stop a pass explicitly via CancelRun.
 func (s *Service) RunNow(ctx context.Context) (Status, error) {
-	if _, err := s.runOnce(ctx, "manual"); err != nil {
+	return s.RunTask(ctx, "")
+}
+
+// RunTask runs either a full housekeeping pass (task == "") or a single named task immediately.
+func (s *Service) RunTask(ctx context.Context, task string) (Status, error) {
+	task = strings.TrimSpace(task)
+	if !isValidTask(task) {
+		return Status{}, fmt.Errorf("%w: unknown task %q", ErrInvalidTask, task)
+	}
+	if _, err := s.runOnce(context.WithoutCancel(ctx), "manual", task); err != nil {
 		return Status{}, err
 	}
 	return s.Status(), nil
+}
+
+// CancelRun requests cancellation of any currently running maintenance pass.
+// Returns true if a running pass was signaled to stop.
+func (s *Service) CancelRun() bool {
+	s.mu.Lock()
+	cancel := s.cancelRun
+	running := s.running
+	if running && s.progress != nil {
+		p := *s.progress
+		p.Label = "Canceling housekeeping pass…"
+		s.progress = &p
+	}
+	s.mu.Unlock()
+	if running && cancel != nil {
+		cancel()
+		return true
+	}
+	return false
 }
 
 func (s *Service) computeNextRunLocked(now time.Time) time.Time {
@@ -378,19 +458,26 @@ func computeNextRun(now time.Time, cfg Config, lastRun *RunReport, lastScheduled
 	return now.Add(interval)
 }
 
-func (s *Service) runOnce(ctx context.Context, trigger string) (RunReport, error) {
+func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport, error) {
+	runCtx, cancel := context.WithCancel(ctx)
+
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
+		cancel()
 		return RunReport{}, ErrAlreadyRunning
 	}
 	s.running = true
+	s.cancelRun = cancel
 	cfg := s.cfg
 	s.mu.Unlock()
 
 	defer func() {
+		cancel()
 		s.mu.Lock()
 		s.running = false
+		s.cancelRun = nil
+		s.progress = nil
 		if s.cfg.Enabled {
 			next := s.computeNextRunLocked(time.Now().UTC())
 			s.nextRunAt = &next
@@ -406,61 +493,155 @@ func (s *Service) runOnce(ctx context.Context, trigger string) (RunReport, error
 		}
 	}()
 
+	runArtwork := (task == "" && cfg.CleanupOrphanedArtwork || task == TaskArtwork) && s.dataDir != "" && s.store != nil
+	runTranscode := (task == "" && cfg.CleanupTranscodeCache || task == TaskTranscodeCache) && s.dataDir != ""
+	runAudit := (task == "" && cfg.PruneAuditLogs || task == TaskAudit) && s.store != nil
+	runChapters := (task == "" && cfg.GenerateChapterThumbnails || task == TaskChapterThumbnails) && s.dataDir != "" && s.store != nil && s.ffmpegBin != ""
+	runOptimize := (task == "" && cfg.OptimizeDatabase || task == TaskOptimizeDB) && s.store != nil
+
+	totalSteps := 0
+	if runArtwork {
+		totalSteps++
+	}
+	if runTranscode {
+		totalSteps++
+	}
+	if runAudit {
+		totalSteps++
+	}
+	if runChapters {
+		totalSteps++
+	}
+	if runOptimize {
+		totalSteps++
+	}
+	if totalSteps == 0 {
+		totalSteps = 1
+	}
+
+	stepNum := 0
+	setProgress := func(stage, label, detail string, completed, total int, subFrac float64) {
+		if subFrac < 0 {
+			subFrac = 0
+		}
+		if subFrac > 1 {
+			subFrac = 1
+		}
+		pct := int(((float64(stepNum-1) + subFrac) / float64(totalSteps)) * 100.0)
+		if pct < 0 {
+			pct = 0
+		}
+		if pct > 100 {
+			pct = 100
+		}
+		s.mu.Lock()
+		s.progress = &RunProgress{
+			Stage:      stage,
+			Label:      label,
+			Detail:     detail,
+			Completed:  completed,
+			Total:      total,
+			Percent:    pct,
+			Step:       stepNum,
+			TotalSteps: totalSteps,
+		}
+		s.mu.Unlock()
+	}
+
 	started := time.Now().UTC()
 	report := RunReport{
 		StartedAt: started,
 		Trigger:   trigger,
+		Task:      task,
 	}
 
 	// 1. Orphaned artwork cleanup (guarded against active scans & grace window).
-	if cfg.CleanupOrphanedArtwork && s.dataDir != "" && s.store != nil {
+	if runCtx.Err() == nil && runArtwork {
+		stepNum++
+		setProgress("artwork", "Cleaning orphaned artwork", "", 0, 0, 0)
 		if s.isScanRunning != nil && s.isScanRunning() {
 			report.SkippedArtworkScanBusy = true
 		} else {
-			removed, freed, err := s.cleanOrphanedArtwork(ctx, started.Add(-time.Duration(cfg.ArtworkGraceHours)*time.Hour))
+			removed, freed, err := s.cleanOrphanedArtwork(runCtx, started.Add(-time.Duration(cfg.ArtworkGraceHours)*time.Hour))
 			report.ArtworkFilesRemoved = removed
 			report.ArtworkBytesFreed = freed
-			if err != nil {
+			if err != nil && runCtx.Err() == nil {
 				report.Errors = append(report.Errors, "artwork cleanup: "+err.Error())
 			}
 		}
+		setProgress("artwork", "Cleaning orphaned artwork", "", 1, 1, 1)
 	}
 
 	// 2. Stale transcode session dirs & aged extracted subtitle cache cleanup.
-	if cfg.CleanupTranscodeCache && s.dataDir != "" {
+	if runCtx.Err() == nil && runTranscode {
+		stepNum++
+		setProgress("transcode_cache", "Cleaning transcode & subtitle cache", "", 0, 0, 0)
 		subCutoff := started.Add(-time.Duration(cfg.SubtitleCacheDays) * 24 * time.Hour)
 		sessionCutoff := started.Add(-2 * time.Hour)
 		removed, freed, err := s.cleanTranscodeCache(sessionCutoff, subCutoff)
 		report.TranscodeItemsRemoved = removed
 		report.TranscodeBytesFreed = freed
-		if err != nil {
+		if err != nil && runCtx.Err() == nil {
 			report.Errors = append(report.Errors, "transcode cache cleanup: "+err.Error())
 		}
+		setProgress("transcode_cache", "Cleaning transcode & subtitle cache", "", 1, 1, 1)
 	}
 
 	// 3. Audit log retention pruning.
-	if cfg.PruneAuditLogs && s.store != nil {
+	if runCtx.Err() == nil && runAudit {
+		stepNum++
+		setProgress("audit", "Pruning old audit logs", "", 0, 0, 0)
 		cutoff := started.Add(-time.Duration(cfg.AuditRetentionDays) * 24 * time.Hour)
-		pruned, err := s.store.PruneAuditEventsBefore(ctx, cutoff)
+		pruned, err := s.store.PruneAuditEventsBefore(runCtx, cutoff)
 		report.AuditEventsPruned = pruned
-		if err != nil {
+		if err != nil && runCtx.Err() == nil {
 			report.Errors = append(report.Errors, "audit log pruning: "+err.Error())
 		}
+		setProgress("audit", "Pruning old audit logs", "", 1, 1, 1)
 	}
 
-	// 4. Non-blocking SQLite query-planner optimization + passive WAL checkpoint.
-	if cfg.OptimizeDatabase && s.store != nil {
-		optErr := s.store.Optimize(ctx)
-		cpErr := s.store.CheckpointPassive(ctx)
-		if optErr != nil {
+	// 4. Chapter still thumbnail generation (sequential, capped, yields to active scans/transcodes).
+	if runCtx.Err() == nil && runChapters {
+		stepNum++
+		setProgress("chapter_thumbnails", "Generating chapter stills", "Scanning chapter index…", 0, 0, 0)
+		res, err := s.generateChapterThumbnails(runCtx, func(done, total int, detail string) {
+			frac := 0.0
+			if total > 0 {
+				frac = float64(done) / float64(total)
+			}
+			setProgress("chapter_thumbnails", "Generating chapter stills", detail, done, total, frac)
+		})
+		report.ChapterThumbnailsGenerated = res.Generated
+		report.ChapterThumbnailsExisting = res.Existing
+		report.ChapterThumbnailsTotal = res.Total
+		report.ChapterThumbnailsMissingFiles = res.MissingFiles
+		report.SkippedChaptersBusy = res.SkippedBusy && runCtx.Err() == nil
+		if err != nil && runCtx.Err() == nil {
+			report.Errors = append(report.Errors, "chapter thumbnails: "+err.Error())
+		}
+		setProgress("chapter_thumbnails", "Generating chapter stills", "", res.Total, res.Total, 1)
+	}
+
+	// 5. Non-blocking SQLite query-planner optimization + passive WAL checkpoint.
+	if runCtx.Err() == nil && runOptimize {
+		stepNum++
+		setProgress("optimize_db", "Optimizing SQLite database", "", 0, 0, 0)
+		optErr := s.store.Optimize(runCtx)
+		cpErr := s.store.CheckpointPassive(runCtx)
+		if optErr != nil && runCtx.Err() == nil {
 			report.Errors = append(report.Errors, "db optimize: "+optErr.Error())
 		}
-		if cpErr != nil {
+		if cpErr != nil && runCtx.Err() == nil {
 			report.Errors = append(report.Errors, "wal checkpoint: "+cpErr.Error())
 		}
 		if optErr == nil && cpErr == nil {
 			report.DatabaseOptimized = true
 		}
+		setProgress("optimize_db", "Optimizing SQLite database", "", 1, 1, 1)
+	}
+
+	if runCtx.Err() != nil {
+		report.Canceled = true
 	}
 
 	report.FinishedAt = time.Now().UTC()
@@ -495,6 +676,7 @@ func (s *Service) runOnce(ctx context.Context, trigger string) (RunReport, error
 		"artwork_removed", report.ArtworkFilesRemoved,
 		"transcode_removed", report.TranscodeItemsRemoved,
 		"audit_pruned", report.AuditEventsPruned,
+		"chapter_thumbnails_generated", report.ChapterThumbnailsGenerated,
 		"db_optimized", report.DatabaseOptimized,
 		"errors", len(report.Errors),
 	)
@@ -511,8 +693,13 @@ func (s *Service) cleanOrphanedArtwork(ctx context.Context, graceCutoff time.Tim
 	if err != nil {
 		return 0, 0, err
 	}
+	liveItemIDs, err := s.store.ListAllMediaItemIDs(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
 
 	peopleRoot := filepath.Join(artRoot, "people")
+	chaptersRoot := filepath.Join(artRoot, "chapters")
 	var removed int
 	var bytesFreed int64
 	var dirs []string
@@ -526,13 +713,18 @@ func (s *Service) cleanOrphanedArtwork(ctx context.Context, graceCutoff time.Tim
 		}
 		cleanPath := filepath.Clean(path)
 		if d.IsDir() {
-			if cleanPath != artRoot && cleanPath != peopleRoot {
+			if filepath.Dir(cleanPath) == chaptersRoot {
+				if _, ok := liveItemIDs[d.Name()]; ok {
+					return filepath.SkipDir
+				}
+			}
+			if cleanPath != artRoot && cleanPath != peopleRoot && cleanPath != chaptersRoot {
 				dirs = append(dirs, cleanPath)
 			}
 			return nil
 		}
 		// Never touch in-flight temp files.
-		if strings.HasSuffix(d.Name(), ".tmp") {
+		if strings.HasSuffix(d.Name(), ".tmp") || strings.HasSuffix(d.Name(), ".tmp.jpg") {
 			return nil
 		}
 
