@@ -135,7 +135,7 @@ type RunReport struct {
 	StartedAt                     time.Time `json:"started_at"`
 	FinishedAt                    time.Time `json:"finished_at"`
 	DurationMS                    int64     `json:"duration_ms"`
-	Trigger                       string    `json:"trigger"` // "scheduled" | "manual"
+	Trigger                       string    `json:"trigger"` // "scheduled" | "manual" | "resume"
 	Task                          string    `json:"task,omitempty"`
 	Canceled                      bool      `json:"canceled,omitempty"`
 	SkippedArtworkScanBusy        bool      `json:"skipped_artwork_scan_busy,omitempty"`
@@ -150,6 +150,7 @@ type RunReport struct {
 	ChapterThumbnailsExisting     int       `json:"chapter_thumbnails_existing,omitempty"`
 	ChapterThumbnailsTotal        int       `json:"chapter_thumbnails_total,omitempty"`
 	ChapterThumbnailsMissingFiles int       `json:"chapter_thumbnails_missing_files,omitempty"`
+	ChapterThumbnailsFailed       int       `json:"chapter_thumbnails_failed,omitempty"`
 	Errors                        []string  `json:"errors,omitempty"`
 }
 
@@ -161,7 +162,20 @@ type Status struct {
 	LastRun        *RunReport   `json:"last_run,omitempty"`
 	NextRunAt      *time.Time   `json:"next_run_at,omitempty"`
 	ServerTimezone string       `json:"server_timezone,omitempty"`
+	// ChaptersResumePending is true while chapter still generation is paused for active
+	// scans/playback and will resume automatically once the server has been idle.
+	ChaptersResumePending bool `json:"chapters_resume_pending,omitempty"`
 }
+
+const (
+	// chapterResumePoll is how often a paused chapter pass checks whether playback/scans ended.
+	chapterResumePoll = 15 * time.Second
+	// chapterResumeQuiet is how long the server must stay idle before resuming, so the
+	// short gap between one episode ending and the next auto-playing does not trigger a run.
+	chapterResumeQuiet = 90 * time.Second
+	// chapterResumeMaxWait abandons the automatic resume; the next scheduled pass picks up.
+	chapterResumeMaxWait = 24 * time.Hour
+)
 
 // Options injects runtime hooks used to guard housekeeping against active scans or streams.
 type Options struct {
@@ -181,6 +195,15 @@ type Service struct {
 	logger              *slog.Logger
 
 	reconfigCh chan struct{}
+
+	// baseCtx outlives individual runs so a paused chapter pass can resume on its own.
+	baseCtx       context.Context
+	resumeArmed   bool
+	resumeCancel  context.CancelFunc
+	resumeGen     uint64
+	resumePoll    time.Duration
+	resumeQuiet   time.Duration
+	resumeMaxWait time.Duration
 
 	updateMu        sync.Mutex
 	mu              sync.Mutex
@@ -209,6 +232,10 @@ func NewService(ctx context.Context, s *store.Store, opts Options) *Service {
 		logger:              logger,
 		reconfigCh:          make(chan struct{}, 1),
 		cfg:                 DefaultConfig(),
+		baseCtx:             context.WithoutCancel(ctx),
+		resumePoll:          chapterResumePoll,
+		resumeQuiet:         chapterResumeQuiet,
+		resumeMaxWait:       chapterResumeMaxWait,
 	}
 	svc.loadPersisted(ctx)
 	return svc
@@ -248,9 +275,10 @@ func (s *Service) Status() Status {
 	defer s.mu.Unlock()
 	tzName, _ := time.Now().In(time.Local).Zone()
 	out := Status{
-		Config:         s.cfg,
-		Running:        s.running,
-		ServerTimezone: tzName,
+		Config:                s.cfg,
+		Running:               s.running,
+		ServerTimezone:        tzName,
+		ChaptersResumePending: s.resumeArmed,
 	}
 	if s.progress != nil {
 		p := *s.progress
@@ -368,23 +396,30 @@ func (s *Service) RunTask(ctx context.Context, task string) (Status, error) {
 	return s.Status(), nil
 }
 
-// CancelRun requests cancellation of any currently running maintenance pass.
-// Returns true if a running pass was signaled to stop.
+// CancelRun requests cancellation of any currently running maintenance pass and drops any
+// pending automatic chapter-still resume. Returns true if a pass or pending resume was stopped.
 func (s *Service) CancelRun() bool {
 	s.mu.Lock()
 	cancel := s.cancelRun
 	running := s.running
+	resumeCancel := s.resumeCancel
+	resumeArmed := s.resumeArmed
+	s.resumeArmed = false
+	s.resumeCancel = nil
 	if running && s.progress != nil {
 		p := *s.progress
 		p.Label = "Canceling housekeeping pass…"
 		s.progress = &p
 	}
 	s.mu.Unlock()
+	if resumeCancel != nil {
+		resumeCancel()
+	}
 	if running && cancel != nil {
 		cancel()
 		return true
 	}
-	return false
+	return resumeArmed
 }
 
 func (s *Service) computeNextRunLocked(now time.Time) time.Time {
@@ -615,6 +650,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		report.ChapterThumbnailsExisting = res.Existing
 		report.ChapterThumbnailsTotal = res.Total
 		report.ChapterThumbnailsMissingFiles = res.MissingFiles
+		report.ChapterThumbnailsFailed = res.Unextractable
 		report.SkippedChaptersBusy = res.SkippedBusy && runCtx.Err() == nil
 		if err != nil && runCtx.Err() == nil {
 			report.Errors = append(report.Errors, "chapter thumbnails: "+err.Error())
@@ -654,6 +690,10 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		s.lastScheduledAt = report.FinishedAt
 	}
 	s.mu.Unlock()
+
+	if report.SkippedChaptersBusy && !report.Canceled {
+		s.armChapterResume()
+	}
 
 	if s.store != nil {
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -832,4 +872,75 @@ func dirSize(path string) int64 {
 		return nil
 	})
 	return total
+}
+
+// armChapterResume starts (at most one) background watcher that re-runs chapter still
+// generation once active scans and transcodes have ended and the server has stayed idle
+// for resumeQuiet. If that pass is interrupted again, it re-arms itself.
+func (s *Service) armChapterResume() {
+	s.mu.Lock()
+	if s.resumeArmed || s.baseCtx == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.resumeArmed = true
+	ctx, cancel := context.WithCancel(s.baseCtx)
+	s.resumeCancel = cancel
+	s.resumeGen++
+	gen := s.resumeGen
+	poll, quiet, maxWait := s.resumePoll, s.resumeQuiet, s.resumeMaxWait
+	s.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		disarm := func() {
+			s.mu.Lock()
+			if s.resumeGen == gen {
+				s.resumeArmed = false
+				s.resumeCancel = nil
+			}
+			s.mu.Unlock()
+		}
+		deadline := time.Now().Add(maxWait)
+		var idleSince time.Time
+		ticker := time.NewTicker(poll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				disarm()
+				return
+			case <-ticker.C:
+			}
+			if time.Now().After(deadline) {
+				s.logger.Info("chapter still generation resume abandoned; next scheduled pass will continue")
+				disarm()
+				return
+			}
+			s.mu.Lock()
+			running := s.running
+			s.mu.Unlock()
+			if running || s.isBusyForChapterThumbnails(ctx) {
+				idleSince = time.Time{}
+				continue
+			}
+			if idleSince.IsZero() {
+				idleSince = time.Now()
+			}
+			if time.Since(idleSince) < quiet {
+				continue
+			}
+			// Disarm before running so a run that pauses again can re-arm a fresh watcher.
+			disarm()
+			s.logger.Info("resuming paused chapter still generation")
+			if _, err := s.runOnce(s.baseCtx, "resume", TaskChapterThumbnails); err != nil {
+				if errors.Is(err, ErrAlreadyRunning) {
+					s.armChapterResume()
+				} else if ctx.Err() == nil {
+					s.logger.Warn("resumed chapter still generation failed", "error", err)
+				}
+			}
+			return
+		}
+	}()
 }

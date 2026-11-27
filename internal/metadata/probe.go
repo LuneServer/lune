@@ -60,20 +60,26 @@ func PopulateChapterThumbnails(dataDir, itemID string, chapters []ChapterInfo) {
 	if err != nil || len(entries) == 0 {
 		return
 	}
-	available := make(map[string]struct{}, len(entries))
+	// Map each still to its mtime so URLs change when a still is regenerated (e.g. after
+	// black-bar cropping); stills are cached by clients for a week.
+	available := make(map[string]int64, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		available[entry.Name()] = struct{}{}
+		var mtime int64
+		if info, err := entry.Info(); err == nil {
+			mtime = info.ModTime().Unix()
+		}
+		available[entry.Name()] = mtime
 	}
 	for i := range chapters {
 		if chapters[i].Index < 0 {
 			continue
 		}
 		name := strconv.Itoa(chapters[i].Index) + ".jpg"
-		if _, ok := available[name]; ok {
-			chapters[i].ThumbnailURL = fmt.Sprintf("/api/v1/items/%s/artwork/chapters/%d", itemID, chapters[i].Index)
+		if mtime, ok := available[name]; ok {
+			chapters[i].ThumbnailURL = fmt.Sprintf("/api/v1/items/%s/artwork/chapters/%d?v=%d", itemID, chapters[i].Index, mtime)
 		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -201,7 +202,7 @@ func TestGenerateChapterThumbnails_BusyGuardAndFFmpegExtraction(t *testing.T) {
 		Title:        "Sample",
 		SortTitle:    "Sample",
 		FilePath:     videoPath,
-		FileMtime:    info.ModTime().Unix(),
+		FileMtime:    info.ModTime().UnixNano(),
 		VideoHDR:     "sdr",
 		ChaptersJSON: string(chaptersJSON),
 	}); err != nil {
@@ -276,5 +277,183 @@ func TestGenerateChapterThumbnails_BusyGuardAndFFmpegExtraction(t *testing.T) {
 	}
 	if st.LastRun.ChapterThumbnailsGenerated != 0 {
 		t.Fatalf("expected 0 chapter thumbnails generated on second pass, got %d", st.LastRun.ChapterThumbnailsGenerated)
+	}
+}
+
+func TestChapterStillUpToDate_UsesNanosecondMtime(t *testing.T) {
+	dir := t.TempDir()
+	still := filepath.Join(dir, "0.jpg")
+	if err := os.WriteFile(still, []byte("jpeg"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stillTime := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(still, stillTime, stillTime); err != nil {
+		t.Fatal(err)
+	}
+	// media_items.file_mtime is Unix nanoseconds; a still written after the file is current.
+	if !chapterStillUpToDate(still, stillTime.Add(-time.Minute).UnixNano()) {
+		t.Fatal("expected still newer than media file to be up to date")
+	}
+	if chapterStillUpToDate(still, stillTime.Add(time.Minute).UnixNano()) {
+		t.Fatal("expected still older than media file to be stale")
+	}
+	if chapterStillUpToDate(filepath.Join(dir, "missing.jpg"), 0) {
+		t.Fatal("expected missing still to be stale")
+	}
+}
+
+func TestPruneStaleChapterStills_RemovesStaleFailedMarkers(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"0.jpg", "0.failed", "5.failed", "5.jpg", "1.tmp.jpg"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneStaleChapterStills(dir, map[int]struct{}{0: {}})
+	for name, want := range map[string]bool{"0.jpg": true, "0.failed": true, "5.failed": false, "5.jpg": false, "1.tmp.jpg": true} {
+		_, err := os.Stat(filepath.Join(dir, name))
+		if got := err == nil; got != want {
+			t.Fatalf("%s exists=%v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestGenerateChapterThumbnails_FailedChapterNotRetried(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	db, err := store.Open(ctx, filepath.Join(dataDir, "lune.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found on PATH")
+	}
+	mediaRoot := t.TempDir()
+	// Not a decodable video: every extraction fails.
+	videoPath := filepath.Join(mediaRoot, "broken.mkv")
+	if err := os.WriteFile(videoPath, []byte("not a video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, _ := os.Stat(videoPath)
+	if err := db.CreateLibrary(ctx, store.Library{ID: "lib-1", Name: "Movies", Kind: "movies", RootPath: mediaRoot}); err != nil {
+		t.Fatal(err)
+	}
+	chaptersJSON, _ := json.Marshal([]metadata.ChapterInfo{{Index: 0, StartMS: 0, EndMS: 4000}})
+	if err := db.UpsertMediaItem(ctx, store.MediaItem{
+		ID: "item-bad", LibraryID: "lib-1", Kind: "movie", Title: "Broken", SortTitle: "Broken",
+		FilePath: videoPath, FileMtime: info.ModTime().UnixNano(), ChaptersJSON: string(chaptersJSON),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService(ctx, db, Options{DataDir: dataDir})
+	first, err := svc.generateChapterThumbnails(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Unextractable != 1 || first.Generated != 0 {
+		t.Fatalf("first pass: got %+v, want 1 unextractable", first)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "artwork", "chapters", "item-bad", "0"+chapterFailedMarkerExt)); err != nil {
+		t.Fatalf("expected failure marker: %v", err)
+	}
+	attempts := 0
+	second, err := svc.generateChapterThumbnails(ctx, func(done, total int, detail string) { attempts++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 || second.Unextractable != 1 {
+		t.Fatalf("second pass should not retry the failed chapter: attempts=%d res=%+v", attempts, second)
+	}
+}
+
+func TestChapterThumbnails_AutoResumeAfterPlaybackEnds(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	db, err := store.Open(ctx, filepath.Join(dataDir, "lune.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+
+	var mu sync.Mutex
+	busy := true
+	svc := NewService(ctx, db, Options{
+		DataDir: dataDir,
+		ActiveTranscodeDirs: func() map[string]struct{} {
+			mu.Lock()
+			defer mu.Unlock()
+			if busy {
+				return map[string]struct{}{"/tmp/active": {}}
+			}
+			return map[string]struct{}{}
+		},
+	})
+	if svc.ffmpegBin == "" {
+		t.Skip("ffmpeg not found on PATH")
+	}
+	svc.resumePoll = 10 * time.Millisecond
+	svc.resumeQuiet = 30 * time.Millisecond
+
+	st, err := svc.RunTask(ctx, TaskChapterThumbnails)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.LastRun.SkippedChaptersBusy || !st.ChaptersResumePending {
+		t.Fatalf("expected paused pass with pending resume, got last_run=%+v pending=%v", st.LastRun, st.ChaptersResumePending)
+	}
+
+	// Still busy: must not resume.
+	time.Sleep(100 * time.Millisecond)
+	if st := svc.Status(); st.LastRun.Trigger != "manual" || !st.ChaptersResumePending {
+		t.Fatalf("resumed while still busy: trigger=%q pending=%v", st.LastRun.Trigger, st.ChaptersResumePending)
+	}
+
+	mu.Lock()
+	busy = false
+	mu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st := svc.Status()
+		if st.LastRun != nil && st.LastRun.Trigger == "resume" && !st.Running {
+			if st.ChaptersResumePending || st.LastRun.SkippedChaptersBusy {
+				t.Fatalf("resumed pass should complete: %+v pending=%v", st.LastRun, st.ChaptersResumePending)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("chapter generation did not resume after playback ended")
+}
+
+func TestCancelRun_DropsPendingChapterResume(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	db, err := store.Open(ctx, filepath.Join(dataDir, "lune.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(ctx, db, Options{
+		DataDir:             dataDir,
+		ActiveTranscodeDirs: func() map[string]struct{} { return map[string]struct{}{"/tmp/active": {}} },
+	})
+	if svc.ffmpegBin == "" {
+		t.Skip("ffmpeg not found on PATH")
+	}
+	if _, err := svc.RunTask(ctx, TaskChapterThumbnails); err != nil {
+		t.Fatal(err)
+	}
+	if !svc.Status().ChaptersResumePending {
+		t.Fatal("expected pending resume")
+	}
+	if !svc.CancelRun() {
+		t.Fatal("expected CancelRun to report the dropped resume")
+	}
+	if svc.Status().ChaptersResumePending {
+		t.Fatal("expected pending resume cleared")
 	}
 }
