@@ -179,6 +179,9 @@ func TestChapterThumbnailsEndpointAndDTOPopulation(t *testing.T) {
 	if plan.Chapters[1].ThumbnailURL != "" {
 		t.Fatalf("playback chapter 1 thumbnail_url = %q, want empty", plan.Chapters[1].ThumbnailURL)
 	}
+	if plan.Trickplay != nil {
+		t.Fatalf("expected no trickplay before generation, got %+v", plan.Trickplay)
+	}
 
 	// 3. Unauthenticated request -> 401.
 	req := httptest.NewRequest(http.MethodGet, wantURL, nil)
@@ -232,6 +235,60 @@ func TestChapterThumbnailsEndpointAndDTOPopulation(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("bad index %q status = %d, want 404", badIdx, rec.Code)
+		}
+	}
+
+	// 8. Trickplay: manifest appears in the playback plan and sheets are served with ACLs.
+	tpDir := metadata.TrickplayDir(dataDir, itemID)
+	if err := os.MkdirAll(tpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest, _ := json.Marshal(metadata.TrickplayManifest{
+		Version: 1, IntervalMS: 10000, ThumbWidth: 320, ThumbHeight: 180, Columns: 10, Rows: 10,
+		ThumbCount: 60, SheetCount: 1, ConfiguredWidth: 320, KeyframesOnly: true, GeneratedAt: 1700000000,
+	})
+	if err := os.WriteFile(filepath.Join(tpDir, metadata.TrickplayManifestName), manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tpDir, "0.jpg"), jpegBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec = doJSON(t, h, http.MethodPost, "/api/v1/items/"+itemID+"/playback", map[string]any{
+		"containers":   []string{"mp4"},
+		"video_codecs": []string{"h264"},
+		"audio_codecs": []string{"aac"},
+	}, adminCookie, "")
+	plan = stream.PlaybackPlan{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &plan); err != nil {
+		t.Fatalf("unmarshal plan: %v", err)
+	}
+	sheetURL := "/api/v1/items/" + itemID + "/trickplay/0.jpg?v=1700000000"
+	if plan.Trickplay == nil || plan.Trickplay.ThumbCount != 60 || len(plan.Trickplay.SheetURLs) != 1 || plan.Trickplay.SheetURLs[0] != sheetURL {
+		t.Fatalf("unexpected trickplay in plan: %+v", plan.Trickplay)
+	}
+
+	get := func(path string, cookie *http.Cookie) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if cookie != nil {
+			req.AddCookie(cookie)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := get(sheetURL, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated trickplay status = %d, want 401", rec.Code)
+	}
+	if rec := get(sheetURL, restrictedCookie); rec.Code != http.StatusForbidden {
+		t.Fatalf("restricted trickplay status = %d, want 403", rec.Code)
+	}
+	rec = get(sheetURL, adminCookie)
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "image/jpeg" || string(rec.Body.Bytes()) != string(jpegBytes) {
+		t.Fatalf("authorized trickplay status = %d ct=%q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	for _, bad := range []string{"1.jpg", "manifest.json", "..%2Fmanifest.json", "0.png", "x.jpg"} {
+		if rec := get("/api/v1/items/"+itemID+"/trickplay/"+bad, adminCookie); rec.Code != http.StatusNotFound {
+			t.Fatalf("trickplay %q status = %d, want 404", bad, rec.Code)
 		}
 	}
 }

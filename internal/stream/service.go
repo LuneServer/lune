@@ -80,25 +80,26 @@ type SubtitleStreamDTO struct {
 
 // PlaybackPlan is returned to clients after capability negotiation.
 type PlaybackPlan struct {
-	SessionID             string                 `json:"session_id"`
-	ItemID                string                 `json:"item_id"`
-	Mode                  string                 `json:"mode"` // "direct" | "remux" | "transcode"
-	Reason                string                 `json:"reason"`
-	VideoCopy             bool                   `json:"video_copy"`
-	AudioCopy             bool                   `json:"audio_copy"`
-	HWAccel               string                 `json:"hw_accel,omitempty"`
-	StreamURL             string                 `json:"stream_url"`
-	MimeType              string                 `json:"mime_type"`
-	AudioTracks           []AudioTrackDTO        `json:"audio_tracks"`
-	Subtitles             []SubtitleStreamDTO    `json:"subtitles"`
-	SelectedAudioIndex    *int                   `json:"selected_audio_index,omitempty"`
-	SelectedSubtitleIndex *int                   `json:"selected_subtitle_index,omitempty"`
-	BurnSubtitleStreamIdx *int                   `json:"burn_subtitle_stream_index,omitempty"`
-	Chapters              []metadata.ChapterInfo `json:"chapters"`
-	TranscodeEnabled      bool                   `json:"transcode_enabled"`
-	ResumePositionMS      int64                  `json:"resume_position_ms"`
-	DurationMS            int64                  `json:"duration_ms"`
-	ExpiresAt             time.Time              `json:"expires_at"`
+	SessionID             string                  `json:"session_id"`
+	ItemID                string                  `json:"item_id"`
+	Mode                  string                  `json:"mode"` // "direct" | "remux" | "transcode"
+	Reason                string                  `json:"reason"`
+	VideoCopy             bool                    `json:"video_copy"`
+	AudioCopy             bool                    `json:"audio_copy"`
+	HWAccel               string                  `json:"hw_accel,omitempty"`
+	StreamURL             string                  `json:"stream_url"`
+	MimeType              string                  `json:"mime_type"`
+	AudioTracks           []AudioTrackDTO         `json:"audio_tracks"`
+	Subtitles             []SubtitleStreamDTO     `json:"subtitles"`
+	SelectedAudioIndex    *int                    `json:"selected_audio_index,omitempty"`
+	SelectedSubtitleIndex *int                    `json:"selected_subtitle_index,omitempty"`
+	BurnSubtitleStreamIdx *int                    `json:"burn_subtitle_stream_index,omitempty"`
+	Chapters              []metadata.ChapterInfo  `json:"chapters"`
+	Trickplay             *metadata.TrickplayInfo `json:"trickplay,omitempty"`
+	TranscodeEnabled      bool                    `json:"transcode_enabled"`
+	ResumePositionMS      int64                   `json:"resume_position_ms"`
+	DurationMS            int64                   `json:"duration_ms"`
+	ExpiresAt             time.Time               `json:"expires_at"`
 }
 
 // ActiveStream represents a currently active playback session visible to admins.
@@ -555,6 +556,7 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		SelectedSubtitleIndex: selectedSubIdx,
 		BurnSubtitleStreamIdx: validBurnSubIdx,
 		Chapters:              chapters,
+		Trickplay:             metadata.LoadTrickplay(s.dataDir, item.ID),
 		TranscodeEnabled:      s.transcoder.Available(),
 		ResumePositionMS:      resumeMS,
 		DurationMS:            item.DurationMS,
