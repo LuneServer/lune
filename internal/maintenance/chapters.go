@@ -3,6 +3,7 @@ package maintenance
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,11 +54,34 @@ func chapterThumbnailSeekMS(ch metadata.ChapterInfo) int64 {
 }
 
 type chapterThumbResult struct {
-	Generated    int
-	Existing     int
-	Total        int
-	MissingFiles int
-	SkippedBusy  bool
+	Generated     int
+	Existing      int
+	Total         int
+	MissingFiles  int
+	Unextractable int
+	SkippedBusy   bool
+}
+
+// chapterFailedMarkerExt names the empty marker file recorded beside a chapter still that
+// FFmpeg could not extract, so the same file version is not retried on every run.
+const chapterFailedMarkerExt = ".failed"
+
+// chapterStillUpToDate reports whether path exists and is at least as new as the media file.
+// fileMtimeNS is media_items.file_mtime, which the scanner stores as Unix nanoseconds.
+func chapterStillUpToDate(path string, fileMtimeNS int64) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	return info.ModTime().UnixNano() >= fileMtimeNS
+}
+
+func markChapterStillFailed(path string) {
+	f, err := os.Create(path)
+	if err != nil {
+		return
+	}
+	_ = f.Close()
 }
 
 type pendingChapterWork struct {
@@ -65,6 +89,46 @@ type pendingChapterWork struct {
 	itemDir      string
 	pending      []metadata.ChapterInfo
 	validIndices map[int]struct{}
+	meta         chapterStillsMeta
+	current      bool  // meta matches this file version and stills version
+	durationMS   int64 // approximate runtime (last chapter end) for bar detection
+}
+
+// chapterStillsVersion bumps whenever stills must be rebuilt for every title
+// (v2: black bars cropped).
+const chapterStillsVersion = 2
+
+// chapterStillsMetaName records, per title, how its stills were built.
+const chapterStillsMetaName = "stills.json"
+
+type chapterStillsMeta struct {
+	Version     int    `json:"version"`
+	SourceMtime int64  `json:"source_mtime"` // media_items.file_mtime (ns)
+	Crop        string `json:"crop,omitempty"`
+}
+
+var errChapterBusy = errors.New("server busy")
+
+func readChapterStillsMeta(itemDir string) chapterStillsMeta {
+	var m chapterStillsMeta
+	if raw, err := os.ReadFile(filepath.Join(itemDir, chapterStillsMetaName)); err == nil {
+		_ = json.Unmarshal(raw, &m)
+	}
+	return m
+}
+
+// removeChapterStills deletes an item's stills and failure markers (not in-flight temp files).
+func removeChapterStills(itemDir string) {
+	entries, _ := os.ReadDir(itemDir)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || strings.Contains(name, ".tmp") {
+			continue
+		}
+		if strings.HasSuffix(name, ".jpg") || strings.HasSuffix(name, chapterFailedMarkerExt) {
+			_ = os.Remove(filepath.Join(itemDir, name))
+		}
+	}
 }
 
 func (s *Service) generateChapterThumbnails(ctx context.Context, onProgress func(done, total int, detail string)) (chapterThumbResult, error) {
@@ -93,17 +157,31 @@ func (s *Service) generateChapterThumbnails(ctx context.Context, onProgress func
 		}
 
 		itemDir := filepath.Join(chaptersRoot, item.ID)
+		meta := readChapterStillsMeta(itemDir)
+		current := meta.Version == chapterStillsVersion && meta.SourceMtime == item.FileMtime
 		validIndices := make(map[int]struct{}, len(chapters))
 		var pending []metadata.ChapterInfo
+		var durationMS int64
 		for _, ch := range chapters {
+			durationMS = max(durationMS, ch.EndMS, ch.StartMS)
 			if ch.Index < 0 {
 				continue
 			}
 			res.Total++
 			validIndices[ch.Index] = struct{}{}
-			targetPath := filepath.Join(itemDir, strconv.Itoa(ch.Index)+".jpg")
-			if info, err := os.Stat(targetPath); err == nil && !info.IsDir() && info.ModTime().Unix() >= item.FileMtime {
+			if !current {
+				// Built by an older stills version (e.g. with black bars) or for an older file.
+				pending = append(pending, ch)
+				continue
+			}
+			if chapterStillUpToDate(filepath.Join(itemDir, strconv.Itoa(ch.Index)+".jpg"), item.FileMtime) {
 				res.Existing++
+				continue
+			}
+			if chapterStillUpToDate(filepath.Join(itemDir, strconv.Itoa(ch.Index)+chapterFailedMarkerExt), item.FileMtime) {
+				// A previous attempt failed for this exact file version (e.g. the chapter starts
+				// past the last decodable frame); don't burn FFmpeg time on it every run.
+				res.Unextractable++
 				continue
 			}
 			pending = append(pending, ch)
@@ -126,6 +204,9 @@ func (s *Service) generateChapterThumbnails(ctx context.Context, onProgress func
 			itemDir:      itemDir,
 			pending:      pending,
 			validIndices: validIndices,
+			meta:         meta,
+			current:      current,
+			durationMS:   durationMS,
 		})
 		totalPendingStills += len(pending)
 	}
@@ -152,6 +233,23 @@ func (s *Service) generateChapterThumbnails(ctx context.Context, onProgress func
 		}
 		isHDR := w.item.VideoHDR != "" && !strings.EqualFold(w.item.VideoHDR, "sdr")
 
+		if !w.current {
+			// Detect letterbox/pillarbox bars once per file version, then rebuild all stills.
+			crop, err := s.detectBlackBars(ctx, w.item.FilePath, w.durationMS)
+			if errors.Is(err, errChapterBusy) || ctx.Err() != nil {
+				res.SkippedBusy = ctx.Err() == nil
+				return res, nil
+			}
+			if err != nil {
+				s.logger.Debug("black bar detection failed; keeping full frame", "item_id", w.item.ID, "error", err)
+			}
+			removeChapterStills(w.itemDir)
+			w.meta = chapterStillsMeta{Version: chapterStillsVersion, SourceMtime: w.item.FileMtime, Crop: crop}
+			if b, err := json.Marshal(w.meta); err == nil {
+				_ = os.WriteFile(filepath.Join(w.itemDir, chapterStillsMetaName), b, 0o644)
+			}
+		}
+
 		for _, ch := range w.pending {
 			if s.isBusyForChapterThumbnails(ctx) {
 				res.SkippedBusy = true
@@ -165,9 +263,15 @@ func (s *Service) generateChapterThumbnails(ctx context.Context, onProgress func
 			tmpPath := filepath.Join(w.itemDir, strconv.Itoa(ch.Index)+".tmp.jpg")
 			seekSec := fmt.Sprintf("%.3f", float64(chapterThumbnailSeekMS(ch))/1000.0)
 
-			if err := s.extractChapterStill(ctx, w.item.FilePath, seekSec, isHDR, tmpPath); err != nil {
+			if err := s.extractChapterStill(ctx, w.item.FilePath, seekSec, isHDR, w.meta.Crop, tmpPath); err != nil {
 				_ = os.Remove(tmpPath)
+				if ctx.Err() != nil {
+					// Canceled mid-extraction: not a property of the file, retry next time.
+					return res, nil
+				}
 				s.logger.Debug("chapter thumbnail extraction failed", "item_id", w.item.ID, "chapter", ch.Index, "error", err)
+				markChapterStillFailed(filepath.Join(w.itemDir, strconv.Itoa(ch.Index)+chapterFailedMarkerExt))
+				res.Unextractable++
 				attempted++
 				continue
 			}
@@ -189,8 +293,11 @@ func (s *Service) generateChapterThumbnails(ctx context.Context, onProgress func
 	return res, nil
 }
 
-func (s *Service) extractChapterStill(ctx context.Context, filePath, seekSec string, isHDR bool, tmpPath string) error {
+func (s *Service) extractChapterStill(ctx context.Context, filePath, seekSec string, isHDR bool, crop, tmpPath string) error {
 	runFFmpeg := func(vf string) error {
+		if crop != "" {
+			vf = crop + "," + vf
+		}
 		cmdCtx, cancel := context.WithTimeout(ctx, chapterThumbTimeout)
 		defer cancel()
 
@@ -240,10 +347,15 @@ func pruneStaleChapterStills(itemDir string, validIndices map[int]struct{}) {
 		if strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".tmp.jpg") {
 			continue
 		}
-		if !strings.HasSuffix(name, ".jpg") {
+		var stem string
+		switch {
+		case strings.HasSuffix(name, ".jpg"):
+			stem = strings.TrimSuffix(name, ".jpg")
+		case strings.HasSuffix(name, chapterFailedMarkerExt):
+			stem = strings.TrimSuffix(name, chapterFailedMarkerExt)
+		default:
 			continue
 		}
-		stem := strings.TrimSuffix(name, ".jpg")
 		idx, err := strconv.Atoi(stem)
 		if err != nil || strconv.Itoa(idx) != stem {
 			continue

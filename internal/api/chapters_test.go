@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -149,7 +150,7 @@ func TestChapterThumbnailsEndpointAndDTOPopulation(t *testing.T) {
 		t.Fatalf("expected 2 chapters, got %d", len(detail.Chapters))
 	}
 	wantURL := "/api/v1/items/" + itemID + "/artwork/chapters/0"
-	if detail.Chapters[0].ThumbnailURL != wantURL {
+	if !strings.HasPrefix(detail.Chapters[0].ThumbnailURL, wantURL+"?v=") {
 		t.Fatalf("detail chapter 0 thumbnail_url = %q, want %q", detail.Chapters[0].ThumbnailURL, wantURL)
 	}
 	if detail.Chapters[1].ThumbnailURL != "" {
@@ -172,7 +173,7 @@ func TestChapterThumbnailsEndpointAndDTOPopulation(t *testing.T) {
 	if len(plan.Chapters) != 2 {
 		t.Fatalf("expected 2 playback chapters, got %d", len(plan.Chapters))
 	}
-	if plan.Chapters[0].ThumbnailURL != wantURL {
+	if !strings.HasPrefix(plan.Chapters[0].ThumbnailURL, wantURL+"?v=") {
 		t.Fatalf("playback chapter 0 thumbnail_url = %q, want %q", plan.Chapters[0].ThumbnailURL, wantURL)
 	}
 	if plan.Chapters[1].ThumbnailURL != "" {
