@@ -2,6 +2,7 @@ package maintenance
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -273,5 +274,69 @@ func TestUniformStamps(t *testing.T) {
 	}
 	if uniformStamps([]int64{0, 10000, 40000}, 10000) {
 		t.Fatal("expected non-uniform after a dropped run")
+	}
+}
+
+// trickplayFor replaces the fixture clip with graph and returns the built manifest.
+func trickplayFor(t *testing.T, graph string, prep func(svc *Service, dataDir string, item store.MediaItem)) metadata.TrickplayManifest {
+	t.Helper()
+	ctx, db, dataDir := setupTrickplayFixture(t, 10)
+	item, err := db.GetMediaItem(ctx, "item-tp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeClip(t, item.FilePath, graph)
+	info, _ := os.Stat(item.FilePath)
+	item.FileMtime = info.ModTime().UnixNano()
+	item.DurationMS = 60000
+	if err := db.UpsertMediaItem(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(ctx, db, Options{DataDir: dataDir})
+	if prep != nil {
+		prep(svc, dataDir, item)
+	}
+	cfg := DefaultConfig()
+	cfg.GenerateTrickplay = true
+	if res, err := svc.generateTrickplay(ctx, cfg, nil); err != nil || res.Generated != 1 {
+		t.Fatalf("generate: res=%+v err=%v", res, err)
+	}
+	m, err := metadata.ReadTrickplayManifest(dataDir, "item-tp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestTrickplay_CropsBlackBarsAndFits16x9(t *testing.T) {
+	cases := []struct {
+		name, graph, crop string
+		w, h              int
+	}{
+		{"letterbox", "testsrc2=size=1920x800:rate=24:duration=60,pad=1920:1080:0:140:black", "crop=1920:800:0:140", 320, 134},
+		{"pillarbox", "testsrc2=size=1440x1080:rate=24:duration=60,pad=1920:1080:240:0:black", "crop=1440:1080:240:0", 240, 180},
+		{"full frame", "testsrc2=size=1920x1080:rate=24:duration=60", "", 320, 180},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := trickplayFor(t, tc.graph, nil)
+			if m.Crop != tc.crop || m.ThumbWidth != tc.w || m.ThumbHeight != tc.h {
+				t.Fatalf("got crop=%q tile=%dx%d, want crop=%q tile=%dx%d", m.Crop, m.ThumbWidth, m.ThumbHeight, tc.crop, tc.w, tc.h)
+			}
+		})
+	}
+}
+
+func TestTrickplay_ReusesChapterStillsCrop(t *testing.T) {
+	// A full-frame clip, but chapter stills already recorded a crop for this exact file
+	// version: trickplay must reuse it instead of detecting again.
+	m := trickplayFor(t, "testsrc2=size=1920x1080:rate=24:duration=60", func(svc *Service, dataDir string, item store.MediaItem) {
+		dir := filepath.Join(dataDir, "artwork", "chapters", item.ID)
+		_ = os.MkdirAll(dir, 0o755)
+		b, _ := json.Marshal(chapterStillsMeta{Version: chapterStillsVersion, SourceMtime: item.FileMtime, Crop: "crop=1920:800:0:140"})
+		_ = os.WriteFile(filepath.Join(dir, chapterStillsMetaName), b, 0o644)
+	})
+	if m.Crop != "crop=1920:800:0:140" || m.ThumbHeight != 134 {
+		t.Fatalf("expected reused chapter crop, got crop=%q tile=%dx%d", m.Crop, m.ThumbWidth, m.ThumbHeight)
 	}
 }

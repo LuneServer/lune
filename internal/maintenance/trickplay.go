@@ -29,6 +29,9 @@ import (
 //   - one FFmpeg pass per item that decodes keyframes only (-skip_frame nokey): roughly one
 //     I-frame decode per GOP instead of every frame;
 //   - single-threaded decode, filtering and encoding at background priority (renice 15);
+//   - letterbox/pillarbox black bars are cropped (shared detection with chapter stills; the
+//     crop chapter stills already detected for the same file version is reused), which cut a
+//     2.40:1 sheet by ~15% and keeps bars out of the preview;
 //   - downscaling uses bicubic (a properly filtered downscale) rather than fast_bilinear: on a
 //     12x shrink fast_bilinear keeps grain as aliased noise, which doubled sheet size in testing
 //     at no measurable decode-time saving;
@@ -50,13 +53,15 @@ import (
 //   - each tile is the keyframe at or before its slot, so precision is the smaller of the
 //     interval and the source's keyframe spacing.
 const (
-	trickplayManifestVersion  = 2
+	trickplayManifestVersion  = 3 // v3: black bars cropped, tiles fit within a 16:9 box
 	trickplayColumns          = 10
 	trickplayRows             = 10
 	maxTrickplayItemsPerRun   = 50
 	trickplayMaxActivePerItem = 90 * time.Minute // CPU-time budget per FFmpeg call (paused time excluded)
-	trickplayBaseVF           = "scale=%d:-2:flags=bicubic"
-	trickplayHDRVF            = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,scale=%d:-2:flags=bicubic"
+	// Tiles fit inside width x (width*9/16): letterboxed (cropped) titles get shorter tiles and
+	// pillarboxed 4:3 titles narrower ones, so cropping never makes a tile larger than 16:9.
+	trickplayFitScale = "scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=bicubic"
+	trickplayHDRChain = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p"
 )
 
 // Tunable in tests.
@@ -241,17 +246,24 @@ func (s *Service) buildTrickplay(ctx context.Context, item store.TrickplaySource
 	}
 	defer os.RemoveAll(buildDir)
 
+	crop, err := s.trickplayCrop(ctx, item, pausedBudget, onPause)
+	if err != nil {
+		return err
+	}
+	prefix := ""
+	if crop != "" {
+		prefix = crop + ","
+	}
+	fit := fmt.Sprintf(trickplayFitScale, cfg.TrickplayWidth, (cfg.TrickplayWidth*9/16)&^1)
+
 	isHDR := item.VideoHDR != "" && !strings.EqualFold(item.VideoHDR, "sdr")
-	var (
-		stampsMS []int64
-		err      error
-	)
+	var stampsMS []int64
 	if isHDR {
-		stampsMS, err = s.renderTrickplayTiles(ctx, item.FilePath, buildDir, fmt.Sprintf(trickplayHDRVF, cfg.TrickplayWidth), cfg, pausedBudget, onPause)
+		stampsMS, err = s.renderTrickplayTiles(ctx, item.FilePath, buildDir, prefix+trickplayHDRChain+","+fit, cfg, pausedBudget, onPause)
 	}
 	if !isHDR || (err != nil && ctx.Err() == nil && !errors.Is(err, errTrickplayBusyTimeout)) {
 		clearDir(buildDir)
-		stampsMS, err = s.renderTrickplayTiles(ctx, item.FilePath, buildDir, fmt.Sprintf(trickplayBaseVF, cfg.TrickplayWidth), cfg, pausedBudget, onPause)
+		stampsMS, err = s.renderTrickplayTiles(ctx, item.FilePath, buildDir, prefix+fit, cfg, pausedBudget, onPause)
 	}
 	if err != nil {
 		return err
@@ -307,6 +319,7 @@ func (s *Service) buildTrickplay(ctx context.Context, item store.TrickplaySource
 		SourceMtime:     item.FileMtime,
 		KeyframesOnly:   true,
 		ConfiguredWidth: cfg.TrickplayWidth,
+		Crop:            crop,
 		GeneratedAt:     time.Now().Unix(),
 	}
 	if !uniformStamps(stampsMS, manifest.IntervalMS) {
@@ -321,6 +334,60 @@ func (s *Service) buildTrickplay(ctx context.Context, item store.TrickplaySource
 	}
 	_ = os.RemoveAll(itemDir)
 	return os.Rename(buildDir, itemDir)
+}
+
+// trickplayCrop returns the black-bar crop filter for an item ("" for none). It reuses the
+// crop chapter stills recorded for the same file version, otherwise detects it, waiting
+// (within the run's pause budget) while the server is busy.
+func (s *Service) trickplayCrop(ctx context.Context, item store.TrickplaySourceItem, pausedBudget *time.Duration, onPause func(bool)) (string, error) {
+	meta := readChapterStillsMeta(filepath.Join(s.dataDir, "artwork", "chapters", item.ID))
+	if meta.Version == chapterStillsVersion && meta.SourceMtime == item.FileMtime {
+		return meta.Crop, nil
+	}
+	for {
+		if err := s.waitTrickplayIdle(ctx, pausedBudget, onPause); err != nil {
+			return "", err
+		}
+		crop, err := s.detectBlackBars(ctx, item.FilePath, item.DurationMS)
+		switch {
+		case errors.Is(err, errChapterBusy):
+			continue // playback started mid-detection; wait again
+		case ctx.Err() != nil:
+			return "", ctx.Err()
+		case err != nil:
+			s.logger.Debug("black bar detection failed; keeping full frame", "item_id", item.ID, "error", err)
+			return "", nil
+		}
+		return crop, nil
+	}
+}
+
+// waitTrickplayIdle blocks while a scan or transcode is active, charging the wait to the
+// run's pause budget.
+func (s *Service) waitTrickplayIdle(ctx context.Context, pausedBudget *time.Duration, onPause func(bool)) error {
+	if !s.isBusyForChapterThumbnails(ctx) {
+		return ctx.Err()
+	}
+	onPause(true)
+	start := time.Now()
+	ticker := time.NewTicker(trickplayBusyPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+		if !s.isBusyForChapterThumbnails(ctx) {
+			*pausedBudget -= time.Since(start)
+			onPause(false)
+			return nil
+		}
+		if *pausedBudget-time.Since(start) <= 0 {
+			*pausedBudget = 0
+			return errTrickplayBusyTimeout
+		}
+	}
 }
 
 // uniformStamps reports whether tile n sits at n*interval for every tile (no tiles dropped),

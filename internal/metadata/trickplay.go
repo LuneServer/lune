@@ -47,6 +47,7 @@ type TrickplayManifest struct {
 	SourceMtime     int64  `json:"source_mtime"` // media_items.file_mtime (ns) the sheets were built from
 	KeyframesOnly   bool   `json:"keyframes_only"`
 	ConfiguredWidth int    `json:"configured_width"` // trickplay_width setting the sheets were built with
+	Crop            string `json:"crop,omitempty"`   // FFmpeg crop filter applied to remove black bars
 	GeneratedAt     int64  `json:"generated_at"`     // unix seconds; used to cache-bust sheet URLs
 	// TimestampsMS lists each tile's media time when near-duplicate tiles were dropped; when
 	// absent, tile n is at n*IntervalMS.
