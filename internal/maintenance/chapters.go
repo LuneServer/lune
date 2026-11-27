@@ -17,23 +17,45 @@ import (
 )
 
 const (
-	maxChapterThumbItemsPerRun = 200
-	chapterThumbTimeout        = 30 * time.Second
-	chapterThumbBaseVF         = "scale=480:-2:flags=fast_bilinear"
-	chapterThumbHDRVF          = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,scale=480:-2:flags=fast_bilinear"
+	chapterThumbTimeout = 30 * time.Second
+	chapterThumbBaseVF  = "scale=480:-2:flags=fast_bilinear"
+	chapterThumbHDRVF   = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,scale=480:-2:flags=fast_bilinear"
 )
+
+// Busy reasons reported when a task yields to foreground work.
+const (
+	BusyReasonScan     = "Library scan in progress"
+	BusyReasonPlayback = "Playback in progress"
+)
+
+// busyReason returns why heavy background work (chapter stills, trickplay, black-bar
+// detection) must yield right now, or "" when the server is idle. Playback counts every
+// client stream (direct play included), not just FFmpeg HLS sessions.
+func (s *Service) busyReason() string {
+	if s.isScanRunning != nil && s.isScanRunning() {
+		return BusyReasonScan
+	}
+	if s.activeTranscodeDirs != nil && len(s.activeTranscodeDirs()) > 0 {
+		return BusyReasonPlayback
+	}
+	if s.isPlaybackActive != nil && s.isPlaybackActive() {
+		return BusyReasonPlayback
+	}
+	return ""
+}
 
 func (s *Service) isBusyForChapterThumbnails(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return true
 	}
-	if s.isScanRunning != nil && s.isScanRunning() {
-		return true
+	reason := s.busyReason()
+	if reason == "" {
+		return false
 	}
-	if s.activeTranscodeDirs != nil && len(s.activeTranscodeDirs()) > 0 {
-		return true
-	}
-	return false
+	s.mu.Lock()
+	s.lastBusyReason = reason
+	s.mu.Unlock()
+	return true
 }
 
 // chapterThumbnailSeekMS computes the seek timestamp (in ms) for a chapter still:
@@ -190,9 +212,6 @@ func (s *Service) generateChapterThumbnails(ctx context.Context, onProgress func
 		pruneStaleChapterStills(itemDir, validIndices)
 
 		if len(pending) == 0 {
-			continue
-		}
-		if len(work) >= maxChapterThumbItemsPerRun {
 			continue
 		}
 		if _, err := os.Stat(item.FilePath); err != nil {

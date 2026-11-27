@@ -85,6 +85,7 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 		Method:      http.MethodPost,
 		Path:        "/api/v1/admin/maintenance/run",
 		Summary:     "Run a full housekeeping maintenance pass or a single task immediately",
+		Description: "Runs synchronously and returns the updated status. A task that could not run (for example while a library scan or playback is active, or when FFmpeg is missing) is listed in `last_run.skipped` with its reason, and `last_run.outcome` is `skipped` (nothing ran), `partial`, `completed` or `canceled`.",
 		Tags:        []string{"Admin"},
 	}, func(ctx context.Context, in *struct {
 		Task string `query:"task" doc:"Optional single task to run: artwork, transcode_cache, audit, chapter_thumbnails, trickplay, or optimize_db"`
@@ -109,8 +110,9 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 		if db != nil {
 			detail := "manual housekeeping completed"
 			if st.LastRun != nil {
-				detail = fmt.Sprintf("task=%s canceled=%t artwork=%d transcode=%d audit_pruned=%d chapters=%d trickplay=%d db_opt=%t",
+				detail = fmt.Sprintf("task=%s outcome=%s canceled=%t artwork=%d transcode=%d audit_pruned=%d chapters=%d trickplay=%d db_opt=%t",
 					in.Task,
+					st.LastRun.Outcome,
 					st.LastRun.Canceled,
 					st.LastRun.ArtworkFilesRemoved,
 					st.LastRun.TranscodeItemsRemoved,
