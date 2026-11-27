@@ -999,6 +999,40 @@ func (s *Store) ListItemsWithChapters(ctx context.Context) ([]ChapterSourceItem,
 	return out, rows.Err()
 }
 
+// TrickplaySourceItem holds the minimal fields required to generate trickplay sprite sheets.
+type TrickplaySourceItem struct {
+	ID         string
+	Title      string
+	FilePath   string
+	FileMtime  int64
+	DurationMS int64
+	VideoHDR   string
+}
+
+// ListItemsForTrickplay returns indexed video items with a known duration, newest first.
+func (s *Store) ListItemsForTrickplay(ctx context.Context) ([]TrickplaySourceItem, error) {
+	rows, err := s.reader.QueryContext(ctx, `
+		SELECT id, title, file_path, file_mtime, duration_ms, video_hdr
+		FROM media_items
+		WHERE kind IN ('movie', 'episode', 'other') AND video_codec != '' AND duration_ms > 0
+		ORDER BY created_at DESC, id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TrickplaySourceItem
+	for rows.Next() {
+		var item TrickplaySourceItem
+		if err := rows.Scan(&item.ID, &item.Title, &item.FilePath, &item.FileMtime, &item.DurationMS, &item.VideoHDR); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
 // ListAllMediaItemIDs returns the set of all live media_items IDs.
 func (s *Store) ListAllMediaItemIDs(ctx context.Context) (map[string]struct{}, error) {
 	rows, err := s.reader.QueryContext(ctx, `SELECT id FROM media_items`)

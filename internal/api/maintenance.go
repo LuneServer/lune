@@ -68,12 +68,13 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 				EventType: "admin.maintenance_config_updated",
 				ActorID:   user.ID,
 				ClientIP:  clientIPFromContext(ctx),
-				Detail: fmt.Sprintf("enabled=%t interval=%dh time=%s artwork=%t(%dh) transcode=%t(%dd) audit=%t(%dd) db_opt=%t chapters=%t",
+				Detail: fmt.Sprintf("enabled=%t interval=%dh time=%s artwork=%t(%dh) transcode=%t(%dd) audit=%t(%dd) db_opt=%t chapters=%t trickplay=%t(%ds,%dpx)",
 					in.Body.Enabled, in.Body.IntervalHours, in.Body.ScheduleTime,
 					in.Body.CleanupOrphanedArtwork, in.Body.ArtworkGraceHours,
 					in.Body.CleanupTranscodeCache, in.Body.SubtitleCacheDays,
 					in.Body.PruneAuditLogs, in.Body.AuditRetentionDays,
-					in.Body.OptimizeDatabase, in.Body.GenerateChapterThumbnails),
+					in.Body.OptimizeDatabase, in.Body.GenerateChapterThumbnails,
+					st.Config.GenerateTrickplay, st.Config.TrickplayIntervalSeconds, st.Config.TrickplayWidth),
 			})
 		}
 		return &MaintenanceStatusResponse{Body: st}, nil
@@ -86,7 +87,7 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 		Summary:     "Run a full housekeeping maintenance pass or a single task immediately",
 		Tags:        []string{"Admin"},
 	}, func(ctx context.Context, in *struct {
-		Task string `query:"task" doc:"Optional single task to run: artwork, transcode_cache, audit, chapter_thumbnails, or optimize_db"`
+		Task string `query:"task" doc:"Optional single task to run: artwork, transcode_cache, audit, chapter_thumbnails, trickplay, or optimize_db"`
 	}) (*MaintenanceStatusResponse, error) {
 		user, _, ok := currentPrincipal(ctx)
 		if !ok {
@@ -108,13 +109,14 @@ func registerMaintenanceAdminRoutes(api huma.API, maintSvc *maintenance.Service,
 		if db != nil {
 			detail := "manual housekeeping completed"
 			if st.LastRun != nil {
-				detail = fmt.Sprintf("task=%s canceled=%t artwork=%d transcode=%d audit_pruned=%d chapters=%d db_opt=%t",
+				detail = fmt.Sprintf("task=%s canceled=%t artwork=%d transcode=%d audit_pruned=%d chapters=%d trickplay=%d db_opt=%t",
 					in.Task,
 					st.LastRun.Canceled,
 					st.LastRun.ArtworkFilesRemoved,
 					st.LastRun.TranscodeItemsRemoved,
 					st.LastRun.AuditEventsPruned,
 					st.LastRun.ChapterThumbnailsGenerated,
+					st.LastRun.TrickplayGenerated,
 					st.LastRun.DatabaseOptimized)
 			}
 			_ = db.InsertAuditEvent(ctx, store.AuditEvent{

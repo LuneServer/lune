@@ -34,12 +34,13 @@ const (
 	TaskTranscodeCache    = "transcode_cache"
 	TaskAudit             = "audit"
 	TaskChapterThumbnails = "chapter_thumbnails"
+	TaskTrickplay         = "trickplay"
 	TaskOptimizeDB        = "optimize_db"
 )
 
 func isValidTask(task string) bool {
 	switch task {
-	case "", TaskArtwork, TaskTranscodeCache, TaskAudit, TaskChapterThumbnails, TaskOptimizeDB:
+	case "", TaskArtwork, TaskTranscodeCache, TaskAudit, TaskChapterThumbnails, TaskTrickplay, TaskOptimizeDB:
 		return true
 	default:
 		return false
@@ -59,6 +60,27 @@ type Config struct {
 	AuditRetentionDays        int    `json:"audit_retention_days"`        // 7..3650 (default 90)
 	OptimizeDatabase          bool   `json:"optimize_database"`           // default true
 	GenerateChapterThumbnails bool   `json:"generate_chapter_thumbnails"` // default true
+	// Trickplay scrubbing previews (keyframe-only sprite sheets). Optional in requests so older
+	// clients keep working; zero interval/width fall back to defaults.
+	GenerateTrickplay        bool `json:"generate_trickplay" required:"false"`         // default false
+	TrickplayIntervalSeconds int  `json:"trickplay_interval_seconds" required:"false"` // 2..60 (default 10)
+	TrickplayWidth           int  `json:"trickplay_width" required:"false"`            // 160..480 (default 320)
+}
+
+const (
+	DefaultTrickplayIntervalSeconds = 10
+	DefaultTrickplayWidth           = 320
+)
+
+// normalize fills defaults for optional fields omitted by older clients or persisted configs.
+func (c Config) normalize() Config {
+	if c.TrickplayIntervalSeconds == 0 {
+		c.TrickplayIntervalSeconds = DefaultTrickplayIntervalSeconds
+	}
+	if c.TrickplayWidth == 0 {
+		c.TrickplayWidth = DefaultTrickplayWidth
+	}
+	return c
 }
 
 // DefaultConfig returns safe, conservative defaults for daily housekeeping at 03:00 local time.
@@ -75,6 +97,8 @@ func DefaultConfig() Config {
 		AuditRetentionDays:        90,
 		OptimizeDatabase:          true,
 		GenerateChapterThumbnails: true,
+		TrickplayIntervalSeconds:  DefaultTrickplayIntervalSeconds,
+		TrickplayWidth:            DefaultTrickplayWidth,
 	}
 }
 
@@ -115,6 +139,12 @@ func (c Config) Validate() error {
 	if c.AuditRetentionDays < 7 || c.AuditRetentionDays > 3650 {
 		return fmt.Errorf("%w: audit_retention_days must be between 7 and 3650", ErrInvalidConfig)
 	}
+	if c.TrickplayIntervalSeconds < 2 || c.TrickplayIntervalSeconds > 60 {
+		return fmt.Errorf("%w: trickplay_interval_seconds must be between 2 and 60", ErrInvalidConfig)
+	}
+	if c.TrickplayWidth < 160 || c.TrickplayWidth > 480 || c.TrickplayWidth%2 != 0 {
+		return fmt.Errorf("%w: trickplay_width must be an even number between 160 and 480", ErrInvalidConfig)
+	}
 	return nil
 }
 
@@ -151,6 +181,12 @@ type RunReport struct {
 	ChapterThumbnailsTotal        int       `json:"chapter_thumbnails_total,omitempty"`
 	ChapterThumbnailsMissingFiles int       `json:"chapter_thumbnails_missing_files,omitempty"`
 	ChapterThumbnailsFailed       int       `json:"chapter_thumbnails_failed,omitempty"`
+	SkippedTrickplayBusy          bool      `json:"skipped_trickplay_busy,omitempty"`
+	TrickplayGenerated            int       `json:"trickplay_generated,omitempty"`
+	TrickplayExisting             int       `json:"trickplay_existing,omitempty"`
+	TrickplayTotal                int       `json:"trickplay_total,omitempty"`
+	TrickplayFailed               int       `json:"trickplay_failed,omitempty"`
+	TrickplayBytes                int64     `json:"trickplay_bytes,omitempty"`
 	Errors                        []string  `json:"errors,omitempty"`
 }
 
@@ -204,6 +240,8 @@ type Service struct {
 	resumePoll    time.Duration
 	resumeQuiet   time.Duration
 	resumeMaxWait time.Duration
+	tpEncOnce     sync.Once
+	tpEnc         trickplayEncoder
 
 	updateMu        sync.Mutex
 	mu              sync.Mutex
@@ -247,7 +285,8 @@ func (s *Service) loadPersisted(ctx context.Context) {
 	}
 	if raw, err := s.store.GetSetting(ctx, ConfigSettingKey); err == nil && strings.TrimSpace(raw) != "" {
 		cfg := DefaultConfig()
-		if err := json.Unmarshal([]byte(raw), &cfg); err == nil && cfg.Validate() == nil {
+		if err := json.Unmarshal([]byte(raw), &cfg); err == nil && cfg.normalize().Validate() == nil {
+			cfg = cfg.normalize()
 			s.cfg = cfg
 		}
 	}
@@ -300,6 +339,7 @@ func (s *Service) Status() Status {
 
 // UpdateConfig validates, persists, and hot-reloads the maintenance schedule.
 func (s *Service) UpdateConfig(ctx context.Context, cfg Config) (Status, error) {
+	cfg = cfg.normalize()
 	if err := cfg.Validate(); err != nil {
 		return Status{}, err
 	}
@@ -532,6 +572,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 	runTranscode := (task == "" && cfg.CleanupTranscodeCache || task == TaskTranscodeCache) && s.dataDir != ""
 	runAudit := (task == "" && cfg.PruneAuditLogs || task == TaskAudit) && s.store != nil
 	runChapters := (task == "" && cfg.GenerateChapterThumbnails || task == TaskChapterThumbnails) && s.dataDir != "" && s.store != nil && s.ffmpegBin != ""
+	runTrickplay := (task == "" && cfg.GenerateTrickplay || task == TaskTrickplay) && s.dataDir != "" && s.store != nil && s.ffmpegBin != ""
 	runOptimize := (task == "" && cfg.OptimizeDatabase || task == TaskOptimizeDB) && s.store != nil
 
 	totalSteps := 0
@@ -545,6 +586,9 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		totalSteps++
 	}
 	if runChapters {
+		totalSteps++
+	}
+	if runTrickplay {
 		totalSteps++
 	}
 	if runOptimize {
@@ -658,7 +702,30 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		setProgress("chapter_thumbnails", "Generating chapter stills", "", res.Total, res.Total, 1)
 	}
 
-	// 5. Non-blocking SQLite query-planner optimization + passive WAL checkpoint.
+	// 5. Trickplay scrubbing previews (keyframe-only, paused in place while streams/scans run).
+	if runCtx.Err() == nil && runTrickplay {
+		stepNum++
+		setProgress("trickplay", "Generating scrubbing previews", "Checking items…", 0, 0, 0)
+		res, err := s.generateTrickplay(runCtx, cfg, func(done, total int, detail string) {
+			frac := 0.0
+			if total > 0 {
+				frac = float64(done) / float64(total)
+			}
+			setProgress("trickplay", "Generating scrubbing previews", detail, done, total, frac)
+		})
+		report.TrickplayGenerated = res.Generated
+		report.TrickplayExisting = res.Existing
+		report.TrickplayTotal = res.Total
+		report.TrickplayFailed = res.Unextractable
+		report.TrickplayBytes = res.Bytes
+		report.SkippedTrickplayBusy = res.SkippedBusy && runCtx.Err() == nil
+		if err != nil && runCtx.Err() == nil {
+			report.Errors = append(report.Errors, "trickplay: "+err.Error())
+		}
+		setProgress("trickplay", "Generating scrubbing previews", "", res.Total, res.Total, 1)
+	}
+
+	// 6. Non-blocking SQLite query-planner optimization + passive WAL checkpoint.
 	if runCtx.Err() == nil && runOptimize {
 		stepNum++
 		setProgress("optimize_db", "Optimizing SQLite database", "", 0, 0, 0)
@@ -740,6 +807,7 @@ func (s *Service) cleanOrphanedArtwork(ctx context.Context, graceCutoff time.Tim
 
 	peopleRoot := filepath.Join(artRoot, "people")
 	chaptersRoot := filepath.Join(artRoot, "chapters")
+	trickplayRoot := filepath.Join(artRoot, "trickplay")
 	var removed int
 	var bytesFreed int64
 	var dirs []string
@@ -753,12 +821,12 @@ func (s *Service) cleanOrphanedArtwork(ctx context.Context, graceCutoff time.Tim
 		}
 		cleanPath := filepath.Clean(path)
 		if d.IsDir() {
-			if filepath.Dir(cleanPath) == chaptersRoot {
+			if parent := filepath.Dir(cleanPath); parent == chaptersRoot || parent == trickplayRoot {
 				if _, ok := liveItemIDs[d.Name()]; ok {
 					return filepath.SkipDir
 				}
 			}
-			if cleanPath != artRoot && cleanPath != peopleRoot && cleanPath != chaptersRoot {
+			if cleanPath != artRoot && cleanPath != peopleRoot && cleanPath != chaptersRoot && cleanPath != trickplayRoot {
 				dirs = append(dirs, cleanPath)
 			}
 			return nil
