@@ -26,7 +26,9 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
       gosu \
       libcap2-bin \
       libva-drm2 \
+      libvulkan1 \
       mesa-va-drivers \
+      mesa-vulkan-drivers \
       tzdata \
       vainfo \
     && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
