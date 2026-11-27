@@ -1055,7 +1055,7 @@ func (t *Transcoder) Shutdown() {
 // ExtractSubtitleVTT extracts an embedded text subtitle stream (ASS/SSA/SRT/WebVTT/mov_text)
 // from inputPath into a cached WebVTT file under <baseDir>/subs, using per-track singleflight
 // deduplication so concurrent requests for different tracks do not block each other.
-func (t *Transcoder) ExtractSubtitleVTT(ctx context.Context, cacheKey, inputPath string, streamIndex int, codec string) (string, error) {
+func (t *Transcoder) ExtractSubtitleVTT(ctx context.Context, cacheKey, inputPath string, streamIndex int) (string, error) {
 	if !t.Available() {
 		return "", ErrFFmpegUnavailable
 	}
@@ -1066,9 +1066,8 @@ func (t *Transcoder) ExtractSubtitleVTT(ctx context.Context, cacheKey, inputPath
 		return "", fmt.Errorf("invalid subtitle stream index %d", streamIndex)
 	}
 	subsDir := filepath.Join(t.baseDir, "subs")
-	assSource := isASSSubtitleCodec(codec)
 	flightKey := fmt.Sprintf("%s_%d", cacheKey, streamIndex)
-	dst := filepath.Join(subsDir, subtitleCacheName(flightKey, assSource))
+	dst := filepath.Join(subsDir, flightKey+".vtt")
 	if info, err := os.Stat(dst); err == nil && info.Size() > 0 {
 		return dst, nil
 	}
@@ -1107,29 +1106,17 @@ func (t *Transcoder) ExtractSubtitleVTT(ctx context.Context, cacheKey, inputPath
 	extractCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
 	defer cancel()
 
-	args := []string{
+	cmd := exec.CommandContext(extractCtx, t.ffmpegBin,
 		"-hide_banner", "-loglevel", "error", "-y",
 		"-i", inputPath,
 		"-map", fmt.Sprintf("0:%d", streamIndex),
 		"-vn", "-an", "-dn",
-	}
-	if assSource {
-		args = append(args, "-c:s", assOutputCodec(codec), "-f", "ass", "pipe:1")
-	} else {
-		args = append(args, "-f", "webvtt", tmp)
-	}
-	cmd := exec.CommandContext(extractCtx, t.ffmpegBin, args...)
+		"-f", "webvtt",
+		tmp,
+	)
 	stderrBuf := &limitedBuffer{max: 2048}
 	cmd.Stderr = stderrBuf
-	var assOut bytes.Buffer
-	if assSource {
-		cmd.Stdout = &assOut
-	}
-	err := cmd.Run()
-	if err == nil && assSource {
-		err = os.WriteFile(tmp, ASSToWebVTTFormatted(assOut.Bytes()), 0o640)
-	}
-	if err != nil {
+	if err := cmd.Run(); err != nil {
 		_ = os.Remove(tmp)
 		msg := stderrBuf.String()
 		if msg != "" {
@@ -1153,7 +1140,7 @@ func (t *Transcoder) ExtractSubtitleVTT(ctx context.Context, cacheKey, inputPath
 // Otherwise, FFmpeg streams WebVTT chunks progressively to w (using fast -ss + -copyts
 // when startSec > 0) so the first cues reach the player in ~0.5–1.5s even on 50GB+ MKVs.
 // When startSec <= 0 and extraction completes cleanly, the output is atomically cached.
-func (t *Transcoder) StreamSubtitleVTT(ctx context.Context, w http.ResponseWriter, r *http.Request, cacheKey, inputPath string, streamIndex int, codec string, startSec float64) error {
+func (t *Transcoder) StreamSubtitleVTT(ctx context.Context, w http.ResponseWriter, r *http.Request, cacheKey, inputPath string, streamIndex int, startSec float64) error {
 	if !t.Available() {
 		return ErrFFmpegUnavailable
 	}
@@ -1164,9 +1151,8 @@ func (t *Transcoder) StreamSubtitleVTT(ctx context.Context, w http.ResponseWrite
 		return fmt.Errorf("invalid subtitle stream index %d", streamIndex)
 	}
 	subsDir := filepath.Join(t.baseDir, "subs")
-	assSource := isASSSubtitleCodec(codec)
 	flightKey := fmt.Sprintf("%s_%d", cacheKey, streamIndex)
-	dst := filepath.Join(subsDir, subtitleCacheName(flightKey, assSource))
+	dst := filepath.Join(subsDir, flightKey+".vtt")
 	if info, err := os.Stat(dst); err == nil && info.Size() > 0 {
 		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 		w.Header().Set("Cache-Control", "private, max-age=3600")
@@ -1182,15 +1168,9 @@ func (t *Transcoder) StreamSubtitleVTT(ctx context.Context, w http.ResponseWrite
 		"-i", inputPath,
 		"-map", fmt.Sprintf("0:%d", streamIndex),
 		"-vn", "-an", "-dn",
+		"-f", "webvtt",
+		"pipe:1",
 	)
-	if assSource {
-		// ASS/SSA is converted in Go (StreamASSToWebVTT) so karaoke is flattened, typeset signs
-		// are grouped into single cues and placement is clamped; FFmpeg's WebVTT muxer emits
-		// inline karaoke timestamps and one cue per event.
-		args = append(args, "-c:s", assOutputCodec(codec), "-f", "ass", "pipe:1")
-	} else {
-		args = append(args, "-f", "webvtt", "pipe:1")
-	}
 
 	cmd := exec.CommandContext(ctx, t.ffmpegBin, args...)
 	stdout, err := cmd.StdoutPipe()
@@ -1217,26 +1197,42 @@ func (t *Transcoder) StreamSubtitleVTT(ctx context.Context, w http.ResponseWrite
 		}
 	}
 
-	sink := &subtitleSink{w: w, cacheFile: cacheFile}
-	sink.flusher, _ = w.(http.Flusher)
-	var readErr error
-	if assSource {
-		readErr = StreamASSToWebVTT(stdout, sink)
-	} else {
-		_, readErr = io.CopyBuffer(sink, stdout, make([]byte, 4096))
-	}
-	writeErr := sink.writeErr
-	if writeErr == nil && readErr != nil {
-		writeErr = readErr
-	}
-	if writeErr != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
-	headerSent := sink.headerSent
-	if sink.cacheFailed {
-		_ = os.Remove(cacheTmp)
-		cacheFile = nil
-		cacheTmp = ""
+	flusher, _ := w.(http.Flusher)
+	headerSent := false
+	buf := make([]byte, 4096)
+	var writeErr error
+	for {
+		n, readErr := stdout.Read(buf)
+		if n > 0 {
+			if !headerSent {
+				w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("X-Accel-Buffering", "no")
+				w.WriteHeader(http.StatusOK)
+				headerSent = true
+			}
+			if cacheFile != nil {
+				if _, cfErr := cacheFile.Write(buf[:n]); cfErr != nil {
+					_ = cacheFile.Close()
+					_ = os.Remove(cacheTmp)
+					cacheFile = nil
+					cacheTmp = ""
+				}
+			}
+			if _, wErr := w.Write(buf[:n]); wErr != nil {
+				writeErr = wErr
+				break
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) && writeErr == nil {
+				writeErr = readErr
+			}
+			break
+		}
 	}
 
 	waitErr := cmd.Wait()
@@ -1274,74 +1270,6 @@ func (t *Transcoder) StreamSubtitleVTT(ctx context.Context, w http.ResponseWrite
 		}
 	}
 	return nil
-}
-
-// subtitleSink forwards converted WebVTT to the client (sending headers on the first write and
-// flushing every chunk) while teeing it into the cache file.
-type subtitleSink struct {
-	w           http.ResponseWriter
-	flusher     http.Flusher
-	cacheFile   *os.File
-	cacheFailed bool
-	headerSent  bool
-	writeErr    error
-}
-
-func (s *subtitleSink) Write(p []byte) (int, error) {
-	if s.writeErr != nil {
-		return 0, s.writeErr
-	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if !s.headerSent {
-		s.w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
-		s.w.Header().Set("Cache-Control", "no-store")
-		s.w.Header().Set("X-Accel-Buffering", "no")
-		s.w.WriteHeader(http.StatusOK)
-		s.headerSent = true
-	}
-	if s.cacheFile != nil && !s.cacheFailed {
-		if _, err := s.cacheFile.Write(p); err != nil {
-			_ = s.cacheFile.Close()
-			s.cacheFailed = true
-		}
-	}
-	if _, err := s.w.Write(p); err != nil {
-		s.writeErr = err
-		return 0, err
-	}
-	if s.flusher != nil {
-		s.flusher.Flush()
-	}
-	return len(p), nil
-}
-
-// isASSSubtitleCodec reports whether an embedded text track is ASS/SSA and should be converted by
-// the Go ASS converter rather than FFmpeg's WebVTT muxer.
-func isASSSubtitleCodec(codec string) bool {
-	switch strings.ToLower(strings.TrimSpace(codec)) {
-	case "ass", "ssa":
-		return true
-	}
-	return false
-}
-
-// assOutputCodec copies ASS packets as-is and re-encodes legacy SSA into ASS events.
-func assOutputCodec(codec string) string {
-	if strings.EqualFold(strings.TrimSpace(codec), "ass") {
-		return "copy"
-	}
-	return "ass"
-}
-
-// subtitleCacheName versions converted ASS caches so WebVTT cached by the old FFmpeg path is
-// never served again.
-func subtitleCacheName(flightKey string, assSource bool) string {
-	if assSource {
-		return flightKey + ".ass2.vtt"
-	}
-	return flightKey + ".vtt"
 }
 
 func (t *Transcoder) effectiveHWAccel(opts TranscodeOptions) HWAccel {

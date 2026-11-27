@@ -351,7 +351,7 @@ func TestTranscoderStartupCleanupAndPathValidation(t *testing.T) {
 	if _, err := tr.EnsureSession(context.Background(), "s1", "u1", "relative/video.mp4", TranscodeOptions{Mode: "transcode"}, "index.m3u8"); err == nil {
 		t.Fatalf("expected error for relative input path in EnsureSession")
 	}
-	if _, err := tr.ExtractSubtitleVTT(context.Background(), "k1", "-dash-file.mkv", 0, "ass"); err == nil {
+	if _, err := tr.ExtractSubtitleVTT(context.Background(), "k1", "-dash-file.mkv", 0); err == nil {
 		t.Fatalf("expected error for relative input path in ExtractSubtitleVTT")
 	}
 }
