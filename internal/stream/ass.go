@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,6 +64,10 @@ type assEvent struct {
 	positioned bool
 	x, y       float64
 	fontSize   float64
+	// space marks a positioned whitespace-only event. Karaoke templates emit one event per
+	// character or syllable and the word gaps as events of their own, so these carry the
+	// source spacing of the line.
+	space bool
 }
 
 // vttCue is one output cue.
@@ -288,7 +293,9 @@ func (p *assParser) parseLine(line string) *assEvent {
 			return nil
 		}
 		if strings.HasPrefix(lower, "dialogue:") {
-			return p.parseDialogue(strings.TrimSpace(trimmed[len("dialogue:"):]))
+			// Keep trailing white space: a karaoke word gap is an event whose text is " ".
+			raw := strings.TrimLeftFunc(line, unicode.IsSpace)
+			return p.parseDialogue(strings.TrimLeftFunc(raw[len("dialogue:"):], unicode.IsSpace))
 		}
 	}
 	return nil
@@ -386,9 +393,12 @@ func (p *assParser) parseDialogue(payload string) *assEvent {
 	st := p.style(styleName)
 
 	ev := &assEvent{start: startMS, end: endMS, alignment: st.alignment, fontSize: st.fontSize}
-	p.parseText(ev, rawText, st)
+	hadText := p.parseText(ev, rawText, st)
 	if len(ev.lines) == 0 {
-		return nil
+		if !hadText || !ev.positioned {
+			return nil
+		}
+		ev.space, ev.plain = true, " "
 	}
 	if ev.fontSize <= 0 {
 		_, resY := p.resolution()
@@ -405,7 +415,9 @@ func (s assStyle) format() assFormat {
 
 // parseText splits ASS dialogue text into formatted runs per visual line, applying override
 // blocks. Unknown tags (karaoke, colours, transforms, clips, fades...) are dropped.
-func (p *assParser) parseText(ev *assEvent, raw string, st assStyle) {
+// parseText reports whether the event had any text at all before trimming (so a whitespace-only
+// positioned event can be kept as a spacing marker).
+func (p *assParser) parseText(ev *assEvent, raw string, st assStyle) bool {
 	cur := st.format()
 	lines := [][]assRun{nil}
 	var b strings.Builder
@@ -451,6 +463,12 @@ func (p *assParser) parseText(ev *assEvent, raw string, st assStyle) {
 	}
 	flush()
 
+	hadText := false
+	for _, l := range lines {
+		if len(l) > 0 {
+			hadText = true
+		}
+	}
 	var kept [][]assRun
 	var plain []string
 	for _, l := range lines {
@@ -463,6 +481,7 @@ func (p *assParser) parseText(ev *assEvent, raw string, st assStyle) {
 	}
 	ev.lines = kept
 	ev.plain = strings.Join(plain, "\n")
+	return hadText
 }
 
 func (p *assParser) applyOverrides(block string, st assStyle, cur *assFormat, ev *assEvent, alignSet, posSet *bool) {
@@ -605,6 +624,8 @@ func runsPlain(l []assRun) string {
 	return b.String()
 }
 
+var reVTTMarkup = regexp.MustCompile(`</?[biu]>`)
+
 var vttEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 
 func renderRuns(l []assRun, formatting bool) string {
@@ -653,11 +674,25 @@ func renderRuns(l []assRun, formatting bool) string {
 
 // assGrouper collects events in start order and emits cues once their group is complete: a
 // group can only grow through events that overlap it in time, so once the newest event starts at
-// or after a group's end, nothing later can join it.
+// or after a group's end, nothing later can join it. Groups are kept in an incremental union-find
+// so a long karaoke chain (one event per character for a whole opening) stays linear per event.
 type assGrouper struct {
-	p         *assParser
+	p *assParser
+	// persist maps a positioned event to the time its text stays on screen at its spot through
+	// the chain of events that redraw it (karaoke char -> highlight -> base); set per group.
+	persist   map[*assEvent]int64
 	pending   []*assEvent
+	boxes     []assBox
+	parent    []int
 	lastStart int64
+}
+
+func (g *assGrouper) find(i int) int {
+	for g.parent[i] != i {
+		g.parent[i] = g.parent[g.parent[i]]
+		i = g.parent[i]
+	}
+	return i
 }
 
 func (g *assGrouper) add(ev *assEvent) []vttCue {
@@ -668,7 +703,18 @@ func (g *assGrouper) add(ev *assEvent) []vttCue {
 	if ev.start > g.lastStart {
 		g.lastStart = ev.start
 	}
+	n := len(g.pending)
 	g.pending = append(g.pending, ev)
+	g.boxes = append(g.boxes, g.box(ev))
+	g.parent = append(g.parent, n)
+	for j := 0; j < n; j++ {
+		if g.pending[j].end <= ev.start || g.find(j) == g.find(n) {
+			continue
+		}
+		if linkASSEvents(g.pending[j], ev, g.boxes[j], g.boxes[n]) {
+			g.parent[g.find(n)] = g.find(j)
+		}
+	}
 	return out
 }
 
@@ -680,69 +726,59 @@ func (g *assGrouper) flush(before int64, all bool) []vttCue {
 	if len(g.pending) == 0 {
 		return nil
 	}
-	groups := g.components(g.pending)
-	var out []vttCue
-	var keep []*assEvent
-	for _, grp := range groups {
-		var maxEnd int64
-		for _, ev := range grp {
-			if ev.end > maxEnd {
-				maxEnd = ev.end
+	maxEnd := map[int]int64{}
+	for i, ev := range g.pending {
+		r := g.find(i)
+		if ev.end > maxEnd[r] {
+			maxEnd[r] = ev.end
+		}
+	}
+	if !all {
+		ready := false
+		for _, e := range maxEnd {
+			if e <= before {
+				ready = true
+				break
 			}
 		}
-		if all || maxEnd <= before {
-			if c, ok := g.render(grp); ok {
-				out = append(out, c)
+		if !ready {
+			return nil
+		}
+	}
+
+	groups := map[int][]*assEvent{}
+	var order []int
+	var keepIdx []int
+	for i, ev := range g.pending {
+		r := g.find(i)
+		if all || maxEnd[r] <= before {
+			if _, ok := groups[r]; !ok {
+				order = append(order, r)
 			}
+			groups[r] = append(groups[r], ev)
 			continue
 		}
-		keep = append(keep, grp...)
+		keepIdx = append(keepIdx, i)
 	}
-	sort.SliceStable(keep, func(i, j int) bool { return keep[i].seq < keep[j].seq })
-	g.pending = keep
-	return out
-}
+	var out []vttCue
+	for _, r := range order {
+		out = append(out, g.render(groups[r])...)
+	}
 
-// components partitions events into groups using union-find over the pairwise link rule.
-func (g *assGrouper) components(evs []*assEvent) [][]*assEvent {
-	parent := make([]int, len(evs))
-	for i := range parent {
-		parent[i] = i
+	// Keep the unfinished groups, remapping union-find roots to the new indices.
+	newIndex := make(map[int]int, len(keepIdx))
+	for ni, oi := range keepIdx {
+		newIndex[oi] = ni
 	}
-	var find func(int) int
-	find = func(i int) int {
-		for parent[i] != i {
-			parent[i] = parent[parent[i]]
-			i = parent[i]
-		}
-		return i
+	pending := make([]*assEvent, len(keepIdx))
+	boxes := make([]assBox, len(keepIdx))
+	parent := make([]int, len(keepIdx))
+	for ni, oi := range keepIdx {
+		pending[ni] = g.pending[oi]
+		boxes[ni] = g.boxes[oi]
+		parent[ni] = newIndex[g.find(oi)]
 	}
-	boxes := make([]assBox, len(evs))
-	for i, ev := range evs {
-		boxes[i] = g.box(ev)
-	}
-	for i := range evs {
-		for j := i + 1; j < len(evs); j++ {
-			if find(i) == find(j) {
-				continue
-			}
-			if linkASSEvents(evs[i], evs[j], boxes[i], boxes[j]) {
-				parent[find(j)] = find(i)
-			}
-		}
-	}
-	idx := map[int]int{}
-	var out [][]*assEvent
-	for i, ev := range evs {
-		r := find(i)
-		k, ok := idx[r]
-		if !ok {
-			k = len(out)
-			idx[r] = k
-			out = append(out, nil)
-		}
-		out[k] = append(out[k], ev)
-	}
+	g.pending, g.boxes, g.parent = pending, boxes, parent
 	return out
 }
 
@@ -754,17 +790,42 @@ type assBox struct {
 func (b assBox) cx() float64 { return (b.left + b.right) / 2 }
 func (b assBox) cy() float64 { return (b.top + b.bottom) / 2 }
 
-// textUnits approximates rendered width in "average glyph" units: CJK/full-width glyphs count 2.
+// textUnits approximates rendered width in ems (font-size units) with a coarse per-glyph table
+// for proportional Latin fonts; CJK/full-width glyphs are 1em. Word gaps in per-character
+// karaoke are only a few pixels wider than a wide letter, so a flat "average glyph" width reads
+// every `w`/`m` as a space.
 func textUnits(s string) float64 {
 	var n float64
 	for _, r := range s {
-		if isWideRune(r) {
-			n += 2
-		} else {
-			n++
-		}
+		n += glyphEm(r)
 	}
 	return n
+}
+
+func glyphEm(r rune) float64 {
+	switch {
+	case isWideRune(r):
+		return 1
+	case r == ' ':
+		return 0.28
+	case strings.ContainsRune("ijl!',.:;|`’‘", r):
+		return 0.28
+	case strings.ContainsRune("ftrI()[]-\"/“”", r):
+		return 0.36
+	case r == 'm' || r == 'w':
+		return 0.78
+	case r == 'M' || r == 'W':
+		return 0.92
+	case r == 'J':
+		return 0.45
+	case r >= 'A' && r <= 'Z':
+		return 0.68
+	case r >= '0' && r <= '9':
+		return 0.55
+	case r >= 'a' && r <= 'z':
+		return 0.52
+	}
+	return 0.55
 }
 
 func isWideRune(r rune) bool {
@@ -795,16 +856,22 @@ func (g *assGrouper) box(ev *assEvent) assBox {
 	if !ev.positioned {
 		return assBox{}
 	}
-	cw := ev.fontSize * 0.5
 	var w float64
 	for _, l := range ev.lines {
-		w = math.Max(w, textUnits(runsPlain(l))*cw)
+		w = math.Max(w, textUnits(runsPlain(l))*ev.fontSize)
 	}
-	h := float64(len(ev.lines)) * ev.fontSize
+	if ev.space {
+		w = textUnits(" ") * ev.fontSize
+	}
+	h := float64(lineCount(ev)) * ev.fontSize
 	ax, ay := anchorFractions(ev.alignment)
 	left := ev.x - ax*w
 	top := ev.y - ay*h
 	return assBox{left: left, top: top, right: left + w, bottom: top + h}
+}
+
+func lineCount(ev *assEvent) int {
+	return max(1, len(ev.lines))
 }
 
 func timeOverlapMajority(a, b *assEvent) bool {
@@ -817,8 +884,17 @@ func timeOverlapMajority(a, b *assEvent) bool {
 }
 
 // linkASSEvents reports whether two events belong in the same cue.
+//
+// Positioned events only need to be on screen together at some instant: the group is later cut
+// into time slices (see renderPositioned), so linking a whole karaoke chain is harmless.
 func linkASSEvents(a, b *assEvent, ba, bb assBox) bool {
-	if a.positioned != b.positioned || !timeOverlapMajority(a, b) {
+	if a.positioned != b.positioned {
+		return false
+	}
+	if !a.positioned && !timeOverlapMajority(a, b) {
+		return false
+	}
+	if min(a.end, b.end) <= max(a.start, b.start) {
 		return false
 	}
 	if !a.positioned {
@@ -826,12 +902,16 @@ func linkASSEvents(a, b *assEvent, ba, bb assBox) bool {
 		return a.plain == b.plain && a.alignment == b.alignment
 	}
 	fs := math.Max(a.fontSize, b.fontSize)
-	if a.plain == b.plain && math.Abs(ba.cx()-bb.cx()) <= fs && math.Abs(ba.cy()-bb.cy()) <= fs {
+	if a.plain == b.plain && math.Abs(ba.cx()-bb.cx()) <= fs*0.15 && math.Abs(ba.cy()-bb.cy()) <= fs*0.15 {
 		return true
+	}
+	if a.space || b.space {
+		// A spacing marker only joins the row it sits in.
+		return math.Abs(ba.cy()-bb.cy()) <= fs*0.5 && math.Max(bb.left-ba.right, ba.left-bb.right) <= fs*1.5
 	}
 	hgap := math.Max(bb.left-ba.right, ba.left-bb.right)
 	// Same row, e.g. karaoke syllables or words typeset as separate events.
-	if len(a.lines) == 1 && len(b.lines) == 1 && math.Abs(ba.cy()-bb.cy()) <= fs*0.5 {
+	if lineCount(a) == 1 && lineCount(b) == 1 && math.Abs(ba.cy()-bb.cy()) <= fs*0.5 {
 		return hgap <= fs*1.5
 	}
 	// Stacked rows of one sign, e.g. "Delicious" above "Gyokuro Tea".
@@ -840,6 +920,7 @@ func linkASSEvents(a, b *assEvent, ba, bb assBox) bool {
 }
 
 type assPiece struct {
+	space bool
 	ev    *assEvent
 	runs  []assRun
 	plain string
@@ -850,8 +931,12 @@ type assPiece struct {
 	fs    float64
 }
 
-// render turns one group of events into a single cue.
-func (g *assGrouper) render(grp []*assEvent) (vttCue, bool) {
+// render turns one group of events into cues: one cue for unpositioned duplicates, time-sliced
+// cues for positioned groups.
+func (g *assGrouper) render(grp []*assEvent) []vttCue {
+	if grp[0].positioned {
+		return g.renderPositioned(grp)
+	}
 	cue := vttCue{seq: grp[0].seq, start: grp[0].start, end: grp[0].end}
 	for _, ev := range grp {
 		cue.start = min(cue.start, ev.start)
@@ -859,8 +944,7 @@ func (g *assGrouper) render(grp []*assEvent) (vttCue, bool) {
 		cue.seq = min(cue.seq, ev.seq)
 	}
 	formatting := g.p.opts.formatting
-
-	if !grp[0].positioned {
+	{
 		// All members are duplicates of one line: keep the earliest.
 		first := grp[0]
 		for _, ev := range grp {
@@ -874,19 +958,270 @@ func (g *assGrouper) render(grp []*assEvent) (vttCue, bool) {
 		}
 		cue.text = strings.Join(lines, "\n")
 		cue.settings = unpositionedSettings(first.alignment)
-		return cue, cue.text != ""
+		if cue.text == "" {
+			return nil
+		}
+		return []vttCue{cue}
 	}
+}
+
+// minStableSliceMS is the shortest time a positioned cue's text must stay unchanged to get a cue
+// of its own. Shorter slices are character-by-character reveals or the hand-over between two
+// lyric lines and are folded into the line that follows them.
+const minStableSliceMS = 350
+
+// renderPositioned cuts a positioned group at every event boundary, lays out the events visible in
+// each slice (karaoke templates swap per-character, highlight and base events for the same
+// syllable over time, so a union over the whole group would show them all at once), then merges
+// slices that read the same and folds short transitional slices into the next line.
+func (g *assGrouper) renderPositioned(grp []*assEvent) []vttCue {
+	cuts := make([]int64, 0, 2*len(grp))
+	for _, ev := range grp {
+		cuts = append(cuts, ev.start, ev.end)
+	}
+	sort.Slice(cuts, func(i, j int) bool { return cuts[i] < cuts[j] })
+	seq := grp[0].seq
+	for _, ev := range grp {
+		seq = min(seq, ev.seq)
+	}
+
+	g.persist = persistenceEnds(grp)
+	defer func() { g.persist = nil }()
+
+	var slices []vttCue
+	var active []*assEvent
+	type scoredText struct {
+		text  string
+		score int
+	}
+	spacing := map[string]scoredText{}
+	for k := 0; k+1 < len(cuts); k++ {
+		from, to := cuts[k], cuts[k+1]
+		if to <= from {
+			continue
+		}
+		active = active[:0]
+		for _, ev := range grp {
+			if ev.start <= from && ev.end >= to {
+				active = append(active, ev)
+			}
+		}
+		text, settings, marked := g.layoutPositioned(active)
+		if text == "" {
+			continue
+		}
+		// The same line is laid out from different pieces over time (characters, then
+		// syllables). Spacing is most reliable from the source's word-gap events, then from the
+		// finest-grained layout (per-character gaps are easier to measure), so every slice of a
+		// line reuses the best one.
+		score := len(active)
+		if marked {
+			score += 1 << 20
+		}
+		key := strings.ReplaceAll(text, " ", "")
+		if prev, ok := spacing[key]; !ok || score > prev.score {
+			spacing[key] = scoredText{text: text, score: score}
+		}
+		if n := len(slices); n > 0 && slices[n-1].end == from && slices[n-1].text == text {
+			slices[n-1].end = to
+			continue
+		}
+		slices = append(slices, vttCue{seq: seq, start: from, end: to, text: text, settings: settings})
+	}
+
+	for i := range slices {
+		if best, ok := spacing[strings.ReplaceAll(slices[i].text, " ", "")]; ok {
+			slices[i].text = best.text
+		}
+	}
+	// Re-merge slices that now read the same.
+	merged := slices[:0]
+	for _, c := range slices {
+		if n := len(merged); n > 0 && merged[n-1].end == c.start && merged[n-1].text == c.text {
+			merged[n-1].end = c.end
+			continue
+		}
+		merged = append(merged, c)
+	}
+	slices = merged
+
+	// 1. Fold short slices (per-character reveal steps, line hand-overs) into the next slice.
+	var stable []vttCue
+	for i := 0; i < len(slices); i++ {
+		c := slices[i]
+		if c.end-c.start < minStableSliceMS {
+			if i+1 < len(slices) && slices[i+1].start == c.end {
+				slices[i+1].start = c.start
+				continue
+			}
+			if n := len(stable); n > 0 && stable[n-1].end == c.start {
+				stable[n-1].end = c.end
+				continue
+			}
+		}
+		stable = append(stable, c)
+	}
+	// 2. A line still being revealed shows as the finished line from its first step.
+	var out []vttCue
+	for i := 0; i < len(stable); i++ {
+		c := stable[i]
+		if i+1 < len(stable) && stable[i+1].start == c.end && revealsInto(c.text, stable[i+1].text) {
+			stable[i+1].start = c.start
+			continue
+		}
+		if n := len(out); n > 0 && out[n-1].end == c.start && out[n-1].text == c.text {
+			out[n-1].end = c.end
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// persistenceEnds returns, per event, when its text leaves its spot: the end of the chain of
+// same-text events at the same position that follow it without a gap.
+func persistenceEnds(grp []*assEvent) map[*assEvent]int64 {
+	byText := map[string][]*assEvent{}
+	for _, ev := range grp {
+		byText[ev.plain] = append(byText[ev.plain], ev)
+	}
+	out := make(map[*assEvent]int64, len(grp))
+	for _, evs := range byText {
+		sort.Slice(evs, func(i, j int) bool { return evs[i].start < evs[j].start })
+		for i, ev := range evs {
+			end := ev.end
+			tol := ev.fontSize * 0.15
+			for _, nx := range evs[i+1:] {
+				if nx.start > end+50 {
+					break
+				}
+				if math.Abs(nx.x-ev.x) <= tol && math.Abs(nx.y-ev.y) <= tol && nx.end > end {
+					end = nx.end
+				}
+			}
+			out[ev] = end
+		}
+	}
+	return out
+}
+
+// dropCrossfades removes an outgoing line that is still fading out where the next line fades in:
+// a piece is covered when a newer piece with different text sits on the same spot of the same row,
+// and the rest of the outgoing line (pieces ending together with a covered piece) goes with it.
+// Without this the two lyric lines read as one.
+func dropCrossfades(pieces []assPiece, persist map[*assEvent]int64) []assPiece {
+	stays := func(pc assPiece) int64 {
+		if e, ok := persist[pc.ev]; ok {
+			return e
+		}
+		return pc.ev.end
+	}
+	covered := make([]bool, len(pieces))
+	var outgoingEnds []int64
+	for i, a := range pieces {
+		wa := a.units * a.fs
+		for j, b := range pieces {
+			// The piece that stays on screen longer belongs to the incoming line.
+			if i == j || a.space || b.space || a.plain == b.plain || stays(b) <= stays(a) {
+				continue
+			}
+			fs := math.Max(a.fs, b.fs)
+			if math.Abs(a.cy-b.cy) > fs*0.5 {
+				continue
+			}
+			wb := b.units * b.fs
+			narrow := math.Min(wa, wb)
+			overlap := math.Min(a.left+wa, b.left+wb) - math.Max(a.left, b.left)
+			if overlap > 0.5*narrow && math.Abs(a.cx-b.cx) < 0.5*narrow+fs*0.1 {
+				covered[i] = true
+				outgoingEnds = append(outgoingEnds, stays(a))
+				break
+			}
+		}
+	}
+	if len(outgoingEnds) == 0 {
+		return pieces
+	}
+	out := pieces[:0:0]
+	for i, pc := range pieces {
+		if covered[i] {
+			continue
+		}
+		outgoing := false
+		for _, e := range outgoingEnds {
+			if d := stays(pc) - e; d > -60 && d < 60 {
+				outgoing = true
+				break
+			}
+		}
+		if !outgoing {
+			out = append(out, pc)
+		}
+	}
+	return out
+}
+
+// revealsInto reports whether cue text a is an incomplete version of b: each line of a is an
+// in-order subset of the characters of a distinct line of b, and b is longer (a karaoke line
+// appearing character by character, possibly with a syllable mid-swap between template layers).
+func revealsInto(a, b string) bool {
+	pa := strings.Split(reVTTMarkup.ReplaceAllString(a, ""), "\n")
+	pb := strings.Split(reVTTMarkup.ReplaceAllString(b, ""), "\n")
+	if len(pa) > len(pb) || len(a) >= len(b) {
+		return false
+	}
+	used := make([]bool, len(pb))
+	for _, la := range pa {
+		found := false
+		for j, lb := range pb {
+			if !used[j] && isSubsequence(strings.ReplaceAll(la, " ", ""), lb) {
+				used[j], found = true, true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func isSubsequence(a, b string) bool {
+	ra := []rune(a)
+	i := 0
+	for _, r := range b {
+		if i < len(ra) && ra[i] == r {
+			i++
+		}
+	}
+	return i == len(ra)
+}
+
+// layoutPositioned lays out positioned events shown together as one cue: rows top to bottom,
+// pieces left to right, duplicate layers dropped.
+//
+// marked reports whether a row's spaces came from whitespace events rather than estimation.
+func (g *assGrouper) layoutPositioned(grp []*assEvent) (text, settings string, marked bool) {
+	formatting := g.p.opts.formatting
 
 	// Split every event into per-line pieces laid out the way libass would.
 	var pieces []assPiece
 	for _, ev := range grp {
 		ax, ay := anchorFractions(ev.alignment)
-		cw := ev.fontSize * 0.5
-		top := ev.y - ay*float64(len(ev.lines))*ev.fontSize
+		top := ev.y - ay*float64(lineCount(ev))*ev.fontSize
+		if ev.space {
+			units := textUnits(" ")
+			left := ev.x - ax*units*ev.fontSize
+			pieces = append(pieces, assPiece{
+				space: true, ev: ev, plain: " ", units: units,
+				left: left, cx: left + units*ev.fontSize/2, cy: top + ev.fontSize/2, fs: ev.fontSize,
+			})
+			continue
+		}
 		for li, l := range ev.lines {
 			plain := runsPlain(l)
 			units := textUnits(plain)
-			w := units * cw
+			w := units * ev.fontSize
 			left := ev.x - ax*w
 			pieces = append(pieces, assPiece{
 				ev: ev, runs: l, plain: plain, units: units,
@@ -907,8 +1242,9 @@ func (g *assGrouper) render(grp []*assEvent) (vttCue, bool) {
 	for _, pc := range pieces {
 		dup := false
 		for _, u := range uniq {
-			tol := math.Max(pc.fs, u.fs)
-			if u.plain == pc.plain && math.Abs(u.cx-pc.cx) <= tol && math.Abs(u.cy-pc.cy) <= tol*0.5 {
+			// Layer copies sit on the same point; a repeated letter ("door") is a glyph apart.
+			tol := math.Max(pc.fs, u.fs) * 0.15
+			if u.plain == pc.plain && math.Abs(u.cx-pc.cx) <= tol && math.Abs(u.cy-pc.cy) <= tol {
 				dup = true
 				break
 			}
@@ -917,6 +1253,8 @@ func (g *assGrouper) render(grp []*assEvent) (vttCue, bool) {
 			uniq = append(uniq, pc)
 		}
 	}
+
+	uniq = dropCrossfades(uniq, g.persist)
 
 	// Rows top to bottom, pieces left to right.
 	sort.SliceStable(uniq, func(i, j int) bool { return uniq[i].cy < uniq[j].cy })
@@ -933,45 +1271,105 @@ func (g *assGrouper) render(grp []*assEvent) (vttCue, bool) {
 	var lines []string
 	for _, row := range rows {
 		sort.SliceStable(row, func(i, j int) bool { return row[i].cx < row[j].cx })
-		lines = append(lines, joinRow(row, formatting))
+		line, rowMarked := joinRow(row, formatting)
+		if line == "" {
+			continue
+		}
+		marked = marked || rowMarked
+		lines = append(lines, line)
 		for _, pc := range row {
-			w := pc.units * pc.fs * 0.5
+			w := pc.units * pc.fs
 			minX = math.Min(minX, pc.left)
 			maxX = math.Max(maxX, pc.left+w)
 			minY = math.Min(minY, pc.cy-pc.fs/2)
 			maxY = math.Max(maxY, pc.cy+pc.fs/2)
 		}
 	}
-	cue.text = strings.Join(lines, "\n")
+	if len(lines) == 0 {
+		return "", "", false
+	}
 	resX, resY := g.p.resolution()
-	cue.settings = positionedSettings((minX+maxX)/2/resX, (minY+maxY)/2/resY)
-	return cue, cue.text != ""
+	return strings.Join(lines, "\n"), positionedSettings((minX+maxX)/2/resX, (minY+maxY)/2/resY), marked
 }
 
-// joinRow concatenates the pieces of one row, inserting a space where the gap between two
-// pieces is wider than the gaps inside words. The glyph width is calibrated from the tightest
-// pair (syllables of one word touch), capped at half the font size.
-func joinRow(row []assPiece, formatting bool) string {
-	cw := row[0].fs * 0.5
+// joinRow concatenates the pieces of one row left to right. When the row carries whitespace
+// events (karaoke templates emit word gaps as their own events) those are the spaces, exactly as
+// in the source. Otherwise a space is inserted where the gap between two neighbours is wider than
+// their estimated glyph widths allow (see textUnits); the em size is calibrated from the row
+// itself (lower quartile, since most neighbours sit inside a word) within ±30% of the font size.
+func joinRow(row []assPiece, formatting bool) (string, bool) {
+	// Runs are concatenated and rendered once so formatting tags do not depend on how the row
+	// happens to be split into pieces (characters vs syllables) at a given moment.
+	var runs []assRun
+	written := false
+	space := func() { runs = append(runs, assRun{text: " ", f: runs[len(runs)-1].f}) }
+	markers := false
+	for _, pc := range row {
+		markers = markers || pc.space
+	}
+	if markers {
+		pending := false
+		for _, pc := range row {
+			if pc.space {
+				pending = written
+				continue
+			}
+			if pending && !strings.HasPrefix(pc.plain, " ") {
+				space()
+			}
+			pending = false
+			runs = append(runs, pc.runs...)
+			written = true
+		}
+		return renderRuns(runs, formatting), true
+	}
+
+	// Anchor-to-anchor distance between neighbours = em * expected + gap, where expected
+	// depends on which point of each piece the alignment anchors.
+	sameAlign := true
+	for _, pc := range row {
+		sameAlign = sameAlign && pc.ev.alignment == row[0].ev.alignment
+	}
+	ax := 0.5
+	if sameAlign {
+		ax, _ = anchorFractions(row[0].ev.alignment)
+	}
+	anchorX := func(pc assPiece) float64 {
+		if sameAlign {
+			return pc.ev.x
+		}
+		return pc.cx
+	}
+	expected := func(i int) float64 {
+		return (1-ax)*row[i].units + ax*row[i+1].units
+	}
+	fs := row[0].fs
+	em := fs
+	var implied []float64
 	for i := 0; i+1 < len(row); i++ {
-		a, b := row[i], row[i+1]
-		if u := (a.units + b.units) / 2; u > 0 {
-			cw = math.Min(cw, (b.cx-a.cx)/u)
+		if e := expected(i); e > 0 {
+			implied = append(implied, (anchorX(row[i+1])-anchorX(row[i]))/e)
 		}
 	}
-	cw = math.Max(cw, row[0].fs*0.2)
-	var b strings.Builder
+	if len(implied) >= 3 {
+		sort.Float64s(implied)
+		em = implied[len(implied)/4]
+	}
+	em = math.Min(math.Max(em, fs*0.7), fs*1.3)
+
 	for i, pc := range row {
 		if i > 0 {
 			prev := row[i-1]
-			gap := (pc.cx - prev.cx) - cw*(prev.units+pc.units)/2
-			if gap > pc.fs*0.25 && !strings.HasSuffix(prev.plain, " ") && !strings.HasPrefix(pc.plain, " ") {
-				b.WriteByte(' ')
+			// Width estimates err in proportion to the glyphs involved, so wider pairs need a
+			// slightly wider gap (tuned on generated karaoke rows with ±18% glyph-width error).
+			gap := (anchorX(pc) - anchorX(prev)) - em*expected(i-1)
+			if gap > em*(0.12+0.04*expected(i-1)) && !strings.HasSuffix(prev.plain, " ") && !strings.HasPrefix(pc.plain, " ") {
+				space()
 			}
 		}
-		b.WriteString(renderRuns(pc.runs, formatting))
+		runs = append(runs, pc.runs...)
 	}
-	return b.String()
+	return renderRuns(runs, formatting), false
 }
 
 func clampPct(v, lo, hi float64) float64 {
