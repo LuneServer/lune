@@ -890,9 +890,11 @@ func (s *Service) ServeSubtitle(w http.ResponseWriter, r *http.Request, token, i
 			return
 		}
 		valid := false
+		codec := ""
 		for _, st := range streams {
 			if st.Index == streamIdx && st.Type == "subtitle" && isTextSubtitleCodec(st.Codec) {
 				valid = true
+				codec = st.Codec
 				break
 			}
 		}
@@ -907,7 +909,7 @@ func (s *Service) ServeSubtitle(w http.ResponseWriter, r *http.Request, token, i
 				startSec = parsed
 			}
 		}
-		if err := s.transcoder.StreamSubtitleVTT(r.Context(), w, r, cacheKey, item.FilePath, streamIdx, startSec); err != nil {
+		if err := s.transcoder.StreamSubtitleVTT(r.Context(), w, r, cacheKey, item.FilePath, streamIdx, codec, startSec); err != nil {
 			if errors.Is(err, ErrFFmpegUnavailable) {
 				http.Error(w, "ffmpeg unavailable for embedded subtitle extraction", http.StatusNotImplemented)
 				return
