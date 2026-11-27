@@ -117,4 +117,4 @@ go vet ./... && go test -race -count=1 ./...
 
 ## License
 
-Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+Licensed under the [GNU Affero General Public License v3.0](LICENSE). Third-party notices and licenses are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
