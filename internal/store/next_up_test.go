@@ -138,3 +138,17 @@ func TestListNextUp(t *testing.T) {
 		t.Fatalf("expected 0 entries for empty ACL, got %d", len(empty))
 	}
 }
+
+func TestUserPreferencesShowChapterMarkers(t *testing.T) {
+	if !DefaultUserPreferences().ShowChapterMarkers {
+		t.Fatal("expected DefaultUserPreferences().ShowChapterMarkers == true")
+	}
+	for _, raw := range []string{"", "{}", `{"combine_next_up":false}`} {
+		if !ParseUserPreferences(raw).ShowChapterMarkers {
+			t.Fatalf("expected ParseUserPreferences(%q).ShowChapterMarkers == true", raw)
+		}
+	}
+	if ParseUserPreferences(`{"show_chapter_markers":false}`).ShowChapterMarkers {
+		t.Fatal("expected show_chapter_markers:false to decode as false")
+	}
+}
