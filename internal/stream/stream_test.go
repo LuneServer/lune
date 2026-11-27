@@ -481,7 +481,7 @@ func TestVODPlaylistAndMasterPlaylist(t *testing.T) {
 	})
 	for _, want := range []string{
 		`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English Atmos",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="16/JOC"`,
-		`CODECS="hvc1.2.4.L150.B0,ec-3",AUDIO="audio"`,
+		`CODECS="hvc1.2.4.L153.B0,ec-3",AUDIO="audio"`,
 		`RESOLUTION=3840x2160`,
 		"\nindex.m3u8\n",
 	} {
@@ -490,10 +490,19 @@ func TestVODPlaylistAndMasterPlaylist(t *testing.T) {
 		}
 	}
 
+	// Remux mode (-c:v copy) must NOT use synthetic 3s VOD playlist (variable source GOPs),
+	// whereas transcode mode (forced 3s keyframes) uses VOD playlist + ffmpeg.m3u8.
+	if usesVODPlaylist(TranscodeOptions{Mode: "remux", DurationMS: 3_600_000}) {
+		t.Fatalf("expected usesVODPlaylist to be false for remux mode")
+	}
+	if !usesVODPlaylist(TranscodeOptions{Mode: "transcode", DurationMS: 3_600_000}) {
+		t.Fatalf("expected usesVODPlaylist to be true for transcode mode")
+	}
+
 	// Seek-restarted VOD FFmpeg args include -output_ts_offset, -start_number, and ffmpeg.m3u8.
 	tr := &Transcoder{ffmpegBin: "/usr/bin/ffmpeg", hwAccel: HWAccelNone}
 	seekArgs := strings.Join(tr.buildFFmpegArgs("/media/movie.mkv", "/tmp/out", TranscodeOptions{
-		Mode:            "remux",
+		Mode:            "transcode",
 		VideoCodec:      "hevc",
 		AudioCopy:       true,
 		DurationMS:      3_600_000,

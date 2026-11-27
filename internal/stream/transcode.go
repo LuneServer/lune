@@ -407,7 +407,11 @@ type TranscodeOptions struct {
 }
 
 func usesVODPlaylist(opts TranscodeOptions) bool {
-	return opts.DurationMS > 0 && opts.DurationMS > opts.StartPositionMS
+	// Only transcode mode forces exact keyframe-aligned 3s segments (-force_key_frames).
+	// Remux mode (-c:v copy) can only split on source keyframes (often 4s-10s GOPs on 4K HEVC),
+	// so synthetic 3s #EXTINF / #EXT-X-TARGETDURATION:4 playlists violate RFC 8216 and trigger
+	// AVPlayer CoreMediaErrorDomain -12927 on tvOS.
+	return opts.Mode == "transcode" && opts.DurationMS > 0 && opts.DurationMS > opts.StartPositionMS
 }
 
 func parseHLSSegmentIndex(fileName string) (int, bool) {
@@ -493,7 +497,11 @@ func buildMasterPlaylist(opts TranscodeOptions) string {
 		switch strings.ToLower(strings.TrimSpace(opts.VideoCodec)) {
 		case "hevc", "h265":
 			if is10BitVideo(opts.VideoProfile, opts.VideoPixFmt) || isHDRSource(opts.VideoHDR) {
-				videoCodec = "hvc1.2.4.L150.B0"
+				if opts.VideoWidth > 1920 || opts.SourceHeight > 1080 {
+					videoCodec = "hvc1.2.4.L153.B0"
+				} else {
+					videoCodec = "hvc1.2.4.L150.B0"
+				}
 			} else {
 				videoCodec = "hvc1.1.6.L120.B0"
 			}
