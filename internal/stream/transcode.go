@@ -26,7 +26,8 @@ var (
 	ErrInvalidSegment    = errors.New("invalid HLS segment name")
 	ErrTooManyTranscodes = errors.New("too many concurrent transcode sessions")
 
-	reAllowedHLSFile = regexp.MustCompile(`^(index\.m3u8|init\.mp4|seg_\d{5}\.(m4s|ts))$`)
+	reAllowedHLSFile = regexp.MustCompile(`^(master\.m3u8|index\.m3u8|init\.mp4|seg_\d{5}\.(m4s|ts))$`)
+	reHLSSegmentFile = regexp.MustCompile(`^seg_(\d{5})\.(m4s|ts)$`)
 )
 
 const (
@@ -36,6 +37,9 @@ const (
 	defaultIdleTTL             = 10 * time.Minute
 	defaultReaperInterval      = 60 * time.Second
 	hlsSegmentSeconds          = 3
+	hlsThrottlePauseAheadSegs  = 30 // pause FFmpeg once 90s ahead of client
+	hlsThrottleResumeAheadSegs = 15 // resume FFmpeg once client is within 45s
+	hlsSeekRestartAheadSegs    = 8  // transparently restart FFmpeg if client jumps >24s ahead
 )
 
 // TranscoderStatus reports detected FFmpeg and hardware acceleration diagnostics.
@@ -98,11 +102,17 @@ type transcodeSession struct {
 	id         string
 	userID     string
 	dir        string
+	inputPath  string
 	hwAccel    HWAccel
+	baseOpts   TranscodeOptions
+	opMu       sync.Mutex // serializes FFmpeg seek-restarts for this session
 	cancel     context.CancelFunc
 	cmd        *exec.Cmd
 	stderr     *limitedBuffer
 	done       chan struct{}
+	startSeg   int
+	lastReqSeg int
+	paused     bool
 	lastAccess time.Time
 }
 
@@ -373,8 +383,15 @@ type TranscodeOptions struct {
 	VideoHDR              string
 	DVProfile             int
 	DVCompatID            int
+	VideoWidth            int
 	SourceHeight          int
+	Bitrate               int64
+	DurationMS            int64
 	AudioCopy             bool
+	AudioCodec            string
+	AudioProfile          string
+	AudioTitle            string
+	AudioLanguage         string
 	AudioChannels         int
 	MaxAudioChannels      int
 	MaxBitrate            int64
@@ -382,10 +399,165 @@ type TranscodeOptions struct {
 	AudioStreamIndex      *int
 	BurnSubtitleStreamIdx *int
 	StartPositionMS       int64
+	StartSegment          int
 	ForceSoftware         bool
 	DisableLibplacebo     bool
 	DisableHWDecode       bool
 	DisableTonemapVAAPI   bool
+}
+
+func usesVODPlaylist(opts TranscodeOptions) bool {
+	return opts.DurationMS > 0 && opts.DurationMS > opts.StartPositionMS
+}
+
+func parseHLSSegmentIndex(fileName string) (int, bool) {
+	m := reHLSSegmentFile.FindStringSubmatch(fileName)
+	if len(m) != 3 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+func highestWrittenSegment(dir string, minSeg int) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return -1
+	}
+	highest := -1
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if idx, ok := parseHLSSegmentIndex(e.Name()); ok && idx >= minSeg && idx > highest {
+			highest = idx
+		}
+	}
+	return highest
+}
+
+// buildVODPlaylist generates a complete HLS VOD media playlist covering remainingMS
+// in hlsSegmentSeconds increments so native players (tvOS AVPlayer, Safari, hls.js)
+// immediately see exact duration, hide the Live badge, and allow full-timeline scrubbing.
+func buildVODPlaylist(remainingMS int64) string {
+	totalSec := float64(remainingMS) / 1000.0
+	if totalSec <= 0 {
+		totalSec = float64(hlsSegmentSeconds)
+	}
+	segCount := int(math.Ceil(totalSec / float64(hlsSegmentSeconds)))
+	if segCount < 1 {
+		segCount = 1
+	}
+	var b strings.Builder
+	b.Grow(256 + segCount*36)
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:7\n")
+	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", hlsSegmentSeconds+1)
+	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+	b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
+	for i := 0; i < segCount; i++ {
+		dur := float64(hlsSegmentSeconds)
+		if i == segCount-1 {
+			rem := totalSec - float64(i*hlsSegmentSeconds)
+			if rem > 0.05 && rem < dur {
+				dur = rem
+			}
+		}
+		fmt.Fprintf(&b, "#EXTINF:%.6f,\nseg_%05d.m4s\n", dur, i)
+	}
+	b.WriteString("#EXT-X-ENDLIST\n")
+	return b.String()
+}
+
+func isDolbyAtmosAudio(codec, profile, title string) bool {
+	if !strings.EqualFold(strings.TrimSpace(codec), "eac3") {
+		return false
+	}
+	p := strings.ToLower(profile)
+	t := strings.ToLower(title)
+	return strings.Contains(p, "atmos") || strings.Contains(p, "joc") ||
+		strings.Contains(t, "atmos") || strings.Contains(t, "joc")
+}
+
+// buildMasterPlaylist generates an RFC 8216 multivariant HLS master playlist referencing
+// index.m3u8 with CODECS and CHANNELS metadata (e.g. ec-3 + CHANNELS="16/JOC" for E-AC-3 Atmos)
+// so Apple TV / AVPlayer can negotiate Dolby Atmos (Dolby MAT 2.0) cleanly.
+func buildMasterPlaylist(opts TranscodeOptions) string {
+	videoCodec := "avc1.640028"
+	if opts.Mode == "remux" {
+		switch strings.ToLower(strings.TrimSpace(opts.VideoCodec)) {
+		case "hevc", "h265":
+			if is10BitVideo(opts.VideoProfile, opts.VideoPixFmt) || isHDRSource(opts.VideoHDR) {
+				videoCodec = "hvc1.2.4.L150.B0"
+			} else {
+				videoCodec = "hvc1.1.6.L120.B0"
+			}
+		case "av1":
+			videoCodec = "av01.0.08M.08"
+		}
+	}
+
+	audioCodec := "mp4a.40.2"
+	if opts.AudioCopy {
+		switch strings.ToLower(strings.TrimSpace(opts.AudioCodec)) {
+		case "eac3":
+			audioCodec = "ec-3"
+		case "ac3":
+			audioCodec = "ac-3"
+		case "mp3":
+			audioCodec = "mp4a.40.34"
+		}
+	}
+
+	channelsAttr := "2"
+	if opts.AudioCopy && isDolbyAtmosAudio(opts.AudioCodec, opts.AudioProfile, opts.AudioTitle) {
+		channelsAttr = "16/JOC"
+	} else if opts.AudioCopy && opts.AudioChannels > 0 {
+		channelsAttr = strconv.Itoa(opts.AudioChannels)
+	} else if !opts.AudioCopy && opts.AudioChannels > 2 && opts.MaxAudioChannels >= 6 {
+		channelsAttr = "6"
+	}
+
+	bandwidth := opts.Bitrate
+	if opts.Mode == "transcode" && opts.MaxBitrate > 0 {
+		bandwidth = opts.MaxBitrate
+	}
+	if bandwidth <= 0 {
+		bandwidth = 12_000_000
+	}
+
+	lang := strings.TrimSpace(opts.AudioLanguage)
+	if lang == "" {
+		lang = "und"
+	}
+	name := strings.ReplaceAll(strings.TrimSpace(opts.AudioTitle), `"`, "")
+	if name == "" {
+		name = "Default"
+	}
+
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:7\n")
+	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+	fmt.Fprintf(&b, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"%s\",LANGUAGE=\"%s\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"%s\"\n",
+		name, lang, channelsAttr)
+	fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d", bandwidth)
+	if opts.VideoWidth > 0 && opts.SourceHeight > 0 {
+		w, h := opts.VideoWidth, opts.SourceHeight
+		if opts.Mode == "transcode" && opts.MaxHeight > 0 && h > opts.MaxHeight {
+			w = int(math.Round(float64(w)*float64(opts.MaxHeight)/float64(h))) &^ 1
+			h = opts.MaxHeight
+		}
+		fmt.Fprintf(&b, ",RESOLUTION=%dx%d", w, h)
+	}
+	fmt.Fprintf(&b, ",CODECS=\"%s,%s\",AUDIO=\"audio\"\n", videoCodec, audioCodec)
+	b.WriteString("index.m3u8\n")
+	return b.String()
 }
 
 // EnsureSession launches an FFmpeg HLS process for sessionID if not already running,
@@ -428,7 +600,79 @@ func (t *Transcoder) EnsureSession(ctx context.Context, sessionID, userID, input
 	return target, err
 }
 
+func (t *Transcoder) launchFFmpegLocked(sess *transcodeSession, opts TranscodeOptions) error {
+	effectiveHW := t.effectiveHWAccel(opts)
+	procCtx, cancel := context.WithCancel(context.Background())
+	args := t.buildFFmpegArgs(sess.inputPath, sess.dir, opts)
+	stderrBuf := &limitedBuffer{max: 4096}
+	cmd := exec.CommandContext(procCtx, t.ffmpegBin, args...)
+	cmd.Stderr = stderrBuf
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return fmt.Errorf("start ffmpeg: %w", err)
+	}
+
+	doneCh := make(chan struct{})
+	sess.hwAccel = effectiveHW
+	sess.cancel = cancel
+	sess.cmd = cmd
+	sess.stderr = stderrBuf
+	sess.done = doneCh
+	sess.startSeg = opts.StartSegment
+	sess.paused = false
+	sess.lastAccess = time.Now()
+
+	go func(s *transcodeSession, c *exec.Cmd, buf *limitedBuffer, hw HWAccel, done chan struct{}, pCtx context.Context) {
+		defer close(done)
+		if waitErr := c.Wait(); waitErr != nil && pCtx.Err() == nil {
+			msg := buf.String()
+			if msg != "" {
+				t.logger.Warn("ffmpeg hls session exited with error", "session_id", s.id, "hw_accel", hw, "error", waitErr, "stderr", msg)
+			} else {
+				t.logger.Warn("ffmpeg hls session exited with error", "session_id", s.id, "hw_accel", hw, "error", waitErr)
+			}
+		}
+	}(sess, cmd, stderrBuf, effectiveHW, doneCh, procCtx)
+
+	go t.throttleLoop(sess, cmd, doneCh, opts.StartSegment)
+	return nil
+}
+
+func (t *Transcoder) throttleLoop(sess *transcodeSession, cmd *exec.Cmd, doneCh <-chan struct{}, startSeg int) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-doneCh:
+			return
+		case <-ticker.C:
+			highest := highestWrittenSegment(sess.dir, startSeg)
+			if highest < startSeg {
+				continue
+			}
+			t.mu.Lock()
+			if sess.cmd != cmd {
+				t.mu.Unlock()
+				return
+			}
+			ahead := highest - sess.lastReqSeg
+			if !sess.paused && ahead >= hlsThrottlePauseAheadSegs {
+				if pauseProcess(cmd) {
+					sess.paused = true
+				}
+			} else if sess.paused && ahead <= hlsThrottleResumeAheadSegs {
+				resumeProcess(cmd)
+				sess.paused = false
+			}
+			t.mu.Unlock()
+		}
+	}
+}
+
 func (t *Transcoder) ensureSessionOnce(ctx context.Context, sessionID, userID, inputPath string, opts TranscodeOptions, fileName string) (string, bool, error) {
+	vodMode := usesVODPlaylist(opts)
+	segIdx, isSeg := parseHLSSegmentIndex(fileName)
+
 	t.mu.Lock()
 	sess, exists := t.sessions[sessionID]
 	if !exists {
@@ -443,42 +687,20 @@ func (t *Transcoder) ensureSessionOnce(ctx context.Context, sessionID, userID, i
 		}
 
 		effectiveHW := t.effectiveHWAccel(opts)
-		procCtx, cancel := context.WithCancel(context.Background())
-		args := t.buildFFmpegArgs(inputPath, dir, opts)
-		stderrBuf := &limitedBuffer{max: 4096}
-		cmd := exec.CommandContext(procCtx, t.ffmpegBin, args...)
-		cmd.Stderr = stderrBuf
-		if err := cmd.Start(); err != nil {
-			cancel()
-			_ = os.RemoveAll(dir)
-			t.mu.Unlock()
-			return "", effectiveHW != HWAccelNone, fmt.Errorf("start ffmpeg: %w", err)
-		}
-
 		sess = &transcodeSession{
 			id:         sessionID,
 			userID:     userID,
 			dir:        dir,
-			hwAccel:    effectiveHW,
-			cancel:     cancel,
-			cmd:        cmd,
-			stderr:     stderrBuf,
-			done:       make(chan struct{}),
+			inputPath:  inputPath,
+			baseOpts:   opts,
 			lastAccess: time.Now(),
 		}
+		if err := t.launchFFmpegLocked(sess, opts); err != nil {
+			_ = os.RemoveAll(dir)
+			t.mu.Unlock()
+			return "", effectiveHW != HWAccelNone, err
+		}
 		t.sessions[sessionID] = sess
-
-		go func(s *transcodeSession) {
-			defer close(s.done)
-			if waitErr := s.cmd.Wait(); waitErr != nil && procCtx.Err() == nil {
-				msg := s.stderr.String()
-				if msg != "" {
-					t.logger.Warn("ffmpeg hls session exited with error", "session_id", s.id, "hw_accel", s.hwAccel, "error", waitErr, "stderr", msg)
-				} else {
-					t.logger.Warn("ffmpeg hls session exited with error", "session_id", s.id, "hw_accel", s.hwAccel, "error", waitErr)
-				}
-			}
-		}(sess)
 
 		t.logger.Info("started hls transcode session",
 			"session_id", sessionID,
@@ -490,6 +712,9 @@ func (t *Transcoder) ensureSessionOnce(ctx context.Context, sessionID, userID, i
 		)
 	} else {
 		sess.lastAccess = time.Now()
+		if isSeg {
+			sess.lastReqSeg = segIdx
+		}
 	}
 	dir := sess.dir
 	doneCh := sess.done
@@ -497,15 +722,145 @@ func (t *Transcoder) ensureSessionOnce(ctx context.Context, sessionID, userID, i
 	stderrBuf := sess.stderr
 	t.mu.Unlock()
 
-	target := filepath.Join(dir, fileName)
+	// Fast path: if a requested segment is already on disk, return it immediately and wake FFmpeg if needed.
+	if isSeg {
+		segTarget := filepath.Join(dir, fileName)
+		if info, err := os.Stat(segTarget); err == nil && info.Size() > 0 {
+			t.mu.Lock()
+			if sess.paused {
+				highest := highestWrittenSegment(dir, sess.startSeg)
+				if highest-sess.lastReqSeg <= hlsThrottleResumeAheadSegs {
+					resumeProcess(sess.cmd)
+					sess.paused = false
+				}
+			}
+			t.mu.Unlock()
+			return segTarget, false, nil
+		}
+
+		// On-demand VOD segment seek: if the client scrubbed outside FFmpeg's current window
+		// (backward before startSeg, >24s ahead of highest written segment, or after FFmpeg exited),
+		// transparently restart FFmpeg at the requested segment index.
+		if vodMode {
+			sess.opMu.Lock()
+			if info, err := os.Stat(segTarget); err == nil && info.Size() > 0 {
+				sess.opMu.Unlock()
+				return segTarget, false, nil
+			}
+
+			t.mu.Lock()
+			curStart := sess.startSeg
+			curDone := sess.done
+			curCmd := sess.cmd
+			curCancel := sess.cancel
+			baseOpts := sess.baseOpts
+			sessPaused := sess.paused
+			t.mu.Unlock()
+
+			highest := highestWrittenSegment(dir, curStart)
+			refHead := curStart
+			if highest > refHead {
+				refHead = highest
+			}
+			procExited := false
+			select {
+			case <-curDone:
+				procExited = true
+			default:
+			}
+
+			needRestart := segIdx < curStart || segIdx > refHead+hlsSeekRestartAheadSegs || procExited
+			if needRestart {
+				seekMS := baseOpts.StartPositionMS + int64(segIdx)*hlsSegmentSeconds*1000
+				if seekMS >= baseOpts.DurationMS {
+					sess.opMu.Unlock()
+					return "", false, ErrInvalidSegment
+				}
+
+				if curCmd != nil {
+					resumeProcess(curCmd)
+				}
+				if curCancel != nil {
+					curCancel()
+				}
+				if curDone != nil {
+					<-curDone
+				}
+
+				seekOpts := baseOpts
+				seekOpts.StartPositionMS = seekMS
+				seekOpts.StartSegment = segIdx
+
+				t.mu.Lock()
+				// Verify session was not stopped while we waited.
+				if t.sessions[sessionID] != sess {
+					t.mu.Unlock()
+					sess.opMu.Unlock()
+					return "", false, fmt.Errorf("transcode session stopped")
+				}
+				if err := t.launchFFmpegLocked(sess, seekOpts); err != nil {
+					t.mu.Unlock()
+					sess.opMu.Unlock()
+					return "", sess.hwAccel != HWAccelNone, err
+				}
+				sess.lastReqSeg = segIdx
+				doneCh = sess.done
+				sessHW = sess.hwAccel
+				stderrBuf = sess.stderr
+				t.mu.Unlock()
+
+				t.logger.Info("restarted hls transcode session for VOD segment seek",
+					"session_id", sessionID,
+					"segment", segIdx,
+					"seek_ms", seekMS,
+				)
+			} else if sessPaused {
+				t.mu.Lock()
+				if sess.paused {
+					resumeProcess(sess.cmd)
+					sess.paused = false
+				}
+				t.mu.Unlock()
+			}
+			sess.opMu.Unlock()
+		}
+	}
+
+	waitName := fileName
+	if fileName == "index.m3u8" && vodMode {
+		// Wait for FFmpeg's internal playlist so startup errors trigger HW->SW fallback,
+		// then serve the complete VOD playlist with #EXT-X-ENDLIST.
+		waitName = "ffmpeg.m3u8"
+	}
+	target := filepath.Join(dir, waitName)
+
 	deadline := time.NewTimer(25 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 
+	finishTarget := func() (string, bool, error) {
+		if fileName == "index.m3u8" && vodMode {
+			vodPath := filepath.Join(dir, "index.m3u8")
+			if info, err := os.Stat(vodPath); err != nil || info.Size() == 0 {
+				content := buildVODPlaylist(opts.DurationMS - opts.StartPositionMS)
+				tmpPath := fmt.Sprintf("%s.%d.tmp", vodPath, time.Now().UnixNano())
+				if err := os.WriteFile(tmpPath, []byte(content), 0o640); err != nil {
+					return "", false, fmt.Errorf("write vod playlist: %w", err)
+				}
+				if err := os.Rename(tmpPath, vodPath); err != nil {
+					_ = os.Remove(tmpPath)
+					return "", false, fmt.Errorf("commit vod playlist: %w", err)
+				}
+			}
+			return vodPath, false, nil
+		}
+		return target, false, nil
+	}
+
 	for {
 		if info, err := os.Stat(target); err == nil && info.Size() > 0 {
-			return target, false, nil
+			return finishTarget()
 		}
 		select {
 		case <-ctx.Done():
@@ -514,7 +869,7 @@ func (t *Transcoder) ensureSessionOnce(ctx context.Context, sessionID, userID, i
 			return "", false, fmt.Errorf("timed out waiting for HLS file %s", fileName)
 		case <-doneCh:
 			if info, err := os.Stat(target); err == nil && info.Size() > 0 {
-				return target, false, nil
+				return finishTarget()
 			}
 			detail := ""
 			if stderrBuf != nil {
@@ -535,6 +890,7 @@ func (t *Transcoder) Stop(sessionID string) {
 	sess, ok := t.sessions[sessionID]
 	if ok {
 		delete(t.sessions, sessionID)
+		resumeProcess(sess.cmd)
 	}
 	t.mu.Unlock()
 
@@ -556,6 +912,7 @@ func (t *Transcoder) StopAsync(sessionID string) {
 	sess, ok := t.sessions[sessionID]
 	if ok {
 		delete(t.sessions, sessionID)
+		resumeProcess(sess.cmd)
 	}
 	t.mu.Unlock()
 
@@ -919,7 +1276,18 @@ func (t *Transcoder) usesLibplacebo(opts TranscodeOptions) bool {
 		return false
 	}
 	hdr := strings.ToLower(strings.TrimSpace(opts.VideoHDR))
-	return hdr == "dovi" || hdr == "dovi_hdr10"
+	if hdr == "dovi_hdr10" {
+		// On VA-API GPUs with verified tonemap_vaapi, prefer zero-copy GPU HDR10 base-layer
+		// tone-mapping over CPU->Vulkan->VA-API libplacebo.
+		hasBurnIn := opts.BurnSubtitleStreamIdx != nil && *opts.BurnSubtitleStreamIdx >= 0
+		if t.effectiveHWAccel(opts) == HWAccelVAAPI &&
+			t.hasTonemapVAAPI && !opts.DisableTonemapVAAPI && !opts.DisableHWDecode &&
+			!hasBurnIn && isVAAPIHWDecodable(opts.VideoCodec, opts.VideoProfile, opts.VideoPixFmt) {
+			return false
+		}
+		return true
+	}
+	return hdr == "dovi"
 }
 
 func isHDRSource(hdr string) bool {
@@ -957,12 +1325,13 @@ func (t *Transcoder) usesVAAPIHWDecode(opts TranscodeOptions) bool {
 		return false
 	}
 	if isHDRSource(opts.VideoHDR) {
-		// Dolby Vision Profile 5 uses proprietary IPTPQc2 and cannot be tone-mapped by tonemap_vaapi.
+		// Dolby Vision Profile 5 uses proprietary IPTPQc2 and cannot be tone-mapped by tonemap_vaapi/zscale.
 		if opts.DVProfile == 5 {
 			return false
 		}
-		// Only keep frames in VA-API GPU memory for HDR if tonemap_vaapi is available.
-		return t.hasTonemapVAAPI && !opts.DisableTonemapVAAPI
+		// Keep VA-API hardware decode even when tonemap_vaapi is unavailable: we can downscale
+		// on the GPU via scale_vaapi, hwdownload to p010, tone-map at target resolution, and hwupload.
+		return true
 	}
 	return true
 }
@@ -1022,12 +1391,38 @@ func (t *Transcoder) buildFFmpegArgs(inputPath, outDir string, opts TranscodeOpt
 		downscale := needsDownscale(opts)
 
 		if useVAAPIHWDec {
-			// Full GPU decode -> GPU filter/tone-map/scale -> VA-API encode pipeline (zero CPU frame copies).
+			// GPU decode -> GPU filter/tone-map/scale -> VA-API encode pipeline.
 			var gpuFilters []string
 			if isHDRSource(opts.VideoHDR) {
-				gpuFilters = append(gpuFilters, "tonemap_vaapi=format=nv12:matrix=bt709:primaries=bt709:transfer=bt709")
-				if downscale {
-					gpuFilters = append(gpuFilters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", opts.MaxHeight))
+				if t.hasTonemapVAAPI && !opts.DisableTonemapVAAPI {
+					gpuFilters = append(gpuFilters, "tonemap_vaapi=format=nv12:matrix=bt709:primaries=bt709:transfer=bt709")
+					if downscale {
+						gpuFilters = append(gpuFilters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", opts.MaxHeight))
+					}
+				} else {
+					// Hybrid GPU decode + GPU downscale -> CPU tone-map (at target resolution) -> GPU encode.
+					if downscale && t.hasScaleVAAPI {
+						gpuFilters = append(gpuFilters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", opts.MaxHeight))
+					}
+					gpuFilters = append(gpuFilters, "hwdownload", "format=p010")
+					if downscale && !t.hasScaleVAAPI {
+						gpuFilters = append(gpuFilters, fmt.Sprintf("scale=trunc(oh*dar/2)*2:min(ih\\,%d),setsar=1", opts.MaxHeight))
+					}
+					if t.hasZscaleTonemap {
+						gpuFilters = append(gpuFilters,
+							"zscale=t=linear:npl=100",
+							"format=gbrpf32le",
+							"zscale=p=bt709",
+							"tonemap=tonemap=hable:desat=0",
+							"zscale=t=bt709:m=bt709:r=tv",
+						)
+					} else {
+						gpuFilters = append(gpuFilters,
+							"scale=in_color_matrix=bt2020:out_color_matrix=bt709",
+							"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
+						)
+					}
+					gpuFilters = append(gpuFilters, "format=nv12", "hwupload")
 				}
 			} else if downscale {
 				gpuFilters = append(gpuFilters, fmt.Sprintf("scale_vaapi=w=-2:h=%d:format=nv12", opts.MaxHeight))
@@ -1039,6 +1434,12 @@ func (t *Transcoder) buildFFmpegArgs(inputPath, outDir string, opts TranscodeOpt
 			// CPU decode / filter pipeline (supports libplacebo DV, CPU zscale+tonemap, bitmap subtitle burn-in,
 			// 10-bit H.264, and SW-decode + HW-encode fallback).
 			var preFilters []string
+			scaledBeforeTonemap := false
+			if downscale && !hasBurnIn && isHDRSource(opts.VideoHDR) && !t.usesLibplacebo(opts) {
+				// Downscale before CPU HDR tone-mapping so zscale/tonemap processes 4x-9x fewer pixels.
+				preFilters = append(preFilters, fmt.Sprintf("scale=trunc(oh*dar/2)*2:min(ih\\,%d),setsar=1", opts.MaxHeight))
+				scaledBeforeTonemap = true
+			}
 			if t.usesLibplacebo(opts) {
 				preFilters = append(preFilters,
 					"libplacebo=tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:apply_dolbyvision=true",
@@ -1059,7 +1460,7 @@ func (t *Transcoder) buildFFmpegArgs(inputPath, outDir string, opts TranscodeOpt
 					"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
 				)
 			}
-			if downscale && !hasBurnIn && effectiveHW != HWAccelVAAPI {
+			if downscale && !hasBurnIn && !scaledBeforeTonemap && effectiveHW != HWAccelVAAPI {
 				preFilters = append(preFilters, fmt.Sprintf("scale=trunc(oh*dar/2)*2:min(ih\\,%d),setsar=1", opts.MaxHeight))
 			}
 
@@ -1069,11 +1470,11 @@ func (t *Transcoder) buildFFmpegArgs(inputPath, outDir string, opts TranscodeOpt
 			}
 			switch effectiveHW {
 			case HWAccelVAAPI:
-				if downscale && !hasBurnIn && len(preFilters) > 0 {
+				if downscale && !hasBurnIn && !scaledBeforeTonemap && len(preFilters) > 0 {
 					postFilters = append(postFilters, fmt.Sprintf("scale=trunc(oh*dar/2)*2:min(ih\\,%d),setsar=1", opts.MaxHeight))
 				}
 				postFilters = append(postFilters, "format=nv12", "hwupload")
-				if downscale && !hasBurnIn && len(preFilters) == 0 {
+				if downscale && !hasBurnIn && !scaledBeforeTonemap && len(preFilters) == 0 {
 					postFilters = append(postFilters, fmt.Sprintf("scale_vaapi=w=-2:h=%d", opts.MaxHeight))
 				}
 			case HWAccelQSV:
@@ -1157,8 +1558,12 @@ func (t *Transcoder) buildFFmpegArgs(inputPath, outDir string, opts TranscodeOpt
 			"-color_range", "tv",
 		)
 
-		// Align keyframes cleanly with HLS segment boundaries for fast startup and crisp seeking.
-		args = append(args, "-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", hlsSegmentSeconds))
+		// Preserve source frame timestamps (avoid CFR frame drops/dups on 23.976fps MKV/VFR sources)
+		// and align keyframes cleanly with HLS segment boundaries for fast startup and crisp seeking.
+		args = append(args,
+			"-fps_mode", "passthrough",
+			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", hlsSegmentSeconds),
+		)
 	}
 
 	if opts.AudioCopy {
@@ -1172,28 +1577,40 @@ func (t *Transcoder) buildFFmpegArgs(inputPath, outDir string, opts TranscodeOpt
 		} else if opts.MaxBitrate > 0 && opts.MaxBitrate <= 4_000_000 {
 			audioBitrate = "192k"
 		}
-		audioFilter := "aresample=async=1:first_pts=0"
-		if opts.Mode == "remux" {
-			// In remux (-c:v copy) mode, omit first_pts=0 so -avoid_negative_ts make_zero shifts
-			// copied video and transcoded audio by the exact same offset without introducing A/V skew.
-			audioFilter = "aresample=async=1"
-		}
-		args = append(args, "-c:a", "aac", "-ac", strconv.Itoa(audioChannels), "-b:a", audioBitrate, "-af", audioFilter)
+		// Omit first_pts=0 so intentional container/post-seek A/V offsets are preserved,
+		// and allow up to 1000 samples/sec soft compensation so small MKV 1ms timebase offsets
+		// converge quickly instead of drifting for an hour.
+		args = append(args, "-c:a", "aac", "-ac", strconv.Itoa(audioChannels), "-b:a", audioBitrate, "-af", "aresample=async=1000")
 	}
 
 	segPattern := filepath.Join(outDir, "seg_%05d.m4s")
-	playlistPath := filepath.Join(outDir, "index.m3u8")
+	playlistName := "index.m3u8"
+	if usesVODPlaylist(opts) {
+		playlistName = "ffmpeg.m3u8"
+	}
+	playlistPath := filepath.Join(outDir, playlistName)
 
 	args = append(args,
 		"-max_muxing_queue_size", "2048",
 		"-avoid_negative_ts", "make_zero",
+	)
+	if opts.StartSegment > 0 {
+		args = append(args, "-output_ts_offset", fmt.Sprintf("%.3f", float64(opts.StartSegment*hlsSegmentSeconds)))
+	}
+	args = append(args,
 		"-f", "hls",
 		"-hls_time", strconv.Itoa(hlsSegmentSeconds),
 		"-hls_list_size", "0",
 		"-hls_playlist_type", "event",
 		"-hls_segment_type", "fmp4",
+		"-hls_segment_options", "movflags=+negative_cts_offsets",
 		"-hls_fmp4_init_filename", "init.mp4",
 		"-hls_flags", "independent_segments+temp_file",
+	)
+	if opts.StartSegment > 0 {
+		args = append(args, "-start_number", strconv.Itoa(opts.StartSegment))
+	}
+	args = append(args,
 		"-hls_segment_filename", segPattern,
 		playlistPath,
 	)
@@ -1356,6 +1773,49 @@ func probeVideoToolbox(ffmpegBin, encoders string) (bool, string) {
 	return false, fmt.Sprintf("videotoolbox: test encode failed (%s)", detail)
 }
 
+func probeTonemapVAAPI(ffmpegBin, dev string) (bool, string) {
+	ok, detail := testFFmpegEncode(ffmpegBin,
+		"-hide_banner", "-loglevel", "error",
+		"-vaapi_device", dev,
+		"-f", "lavfi", "-i", "color=c=black:s=256x144:r=24:d=0.1",
+		"-frames:v", "2",
+		"-vf", "format=p010,hwupload,tonemap_vaapi=format=nv12:matrix=bt709:primaries=bt709:transfer=bt709",
+		"-c:v", "h264_vaapi",
+		"-f", "null", "-",
+	)
+	if ok {
+		return true, fmt.Sprintf("tonemap_vaapi (%s): verified", dev)
+	}
+	return false, fmt.Sprintf("tonemap_vaapi (%s): unavailable on this GPU (%s)", dev, detail)
+}
+
+func probeLibplacebo(ffmpegBin string) (bool, string) {
+	ok, detail := testFFmpegEncode(ffmpegBin,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=black:s=256x144:r=24:d=0.1",
+		"-frames:v", "2",
+		"-vf", "libplacebo=tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,format=yuv420p",
+		"-f", "null", "-",
+	)
+	if ok {
+		return true, "libplacebo: verified Vulkan tone-mapping"
+	}
+	return false, fmt.Sprintf("libplacebo: disabled (%s)", detail)
+}
+
+func finalizeFilterProbes(ffmpegBin string, caps *ffmpegCapabilities) {
+	if caps.hwAccel == HWAccelVAAPI && caps.hasTonemapVAAPI && caps.vaapiDevice != "" {
+		ok, note := probeTonemapVAAPI(ffmpegBin, caps.vaapiDevice)
+		caps.hasTonemapVAAPI = ok
+		caps.probeNotes = append(caps.probeNotes, note)
+	}
+	if caps.hasLibplacebo {
+		ok, note := probeLibplacebo(ffmpegBin)
+		caps.hasLibplacebo = ok
+		caps.probeNotes = append(caps.probeNotes, note)
+	}
+}
+
 func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 	caps := ffmpegCapabilities{hwAccel: HWAccelNone}
 	if ffmpegBin == "" {
@@ -1379,6 +1839,7 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 	switch pref {
 	case "software", "none", "off", "false":
 		caps.probeNotes = []string{"hardware acceleration disabled via LUNE_HW_ACCEL"}
+		finalizeFilterProbes(ffmpegBin, &caps)
 		return caps
 	}
 
@@ -1391,6 +1852,7 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 		if ok {
 			caps.hwAccel = HWAccelVideoToolbox
 		}
+		finalizeFilterProbes(ffmpegBin, &caps)
 		return caps
 	case "nvenc":
 		ok, note := probeNVENC(ffmpegBin, encoders)
@@ -1398,6 +1860,7 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 		if ok {
 			caps.hwAccel = HWAccelNVENC
 		}
+		finalizeFilterProbes(ffmpegBin, &caps)
 		return caps
 	case "vaapi":
 		dev, notes := probeVAAPI(ffmpegBin, encoders, nodes)
@@ -1406,6 +1869,7 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 			caps.hwAccel = HWAccelVAAPI
 			caps.vaapiDevice = dev
 		}
+		finalizeFilterProbes(ffmpegBin, &caps)
 		return caps
 	case "qsv":
 		dev, notes := probeQSV(ffmpegBin, encoders, nodes)
@@ -1414,6 +1878,7 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 			caps.hwAccel = HWAccelQSV
 			caps.vaapiDevice = dev
 		}
+		finalizeFilterProbes(ffmpegBin, &caps)
 		return caps
 	}
 
@@ -1422,10 +1887,10 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 		if ok, note := probeVideoToolbox(ffmpegBin, encoders); ok {
 			caps.hwAccel = HWAccelVideoToolbox
 			caps.probeNotes = append(caps.probeNotes, note)
-			return caps
 		} else {
 			caps.probeNotes = append(caps.probeNotes, note)
 		}
+		finalizeFilterProbes(ffmpegBin, &caps)
 		return caps
 	}
 
@@ -1434,6 +1899,7 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 		caps.probeNotes = append(caps.probeNotes, note)
 		if ok {
 			caps.hwAccel = HWAccelNVENC
+			finalizeFilterProbes(ffmpegBin, &caps)
 			return caps
 		}
 	}
@@ -1443,6 +1909,7 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 			caps.hwAccel = HWAccelVAAPI
 			caps.vaapiDevice = dev
 			caps.probeNotes = append(caps.probeNotes, notes...)
+			finalizeFilterProbes(ffmpegBin, &caps)
 			return caps
 		} else {
 			caps.probeNotes = append(caps.probeNotes, notes...)
@@ -1452,6 +1919,7 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 			caps.hwAccel = HWAccelQSV
 			caps.vaapiDevice = dev
 			caps.probeNotes = append(caps.probeNotes, notes...)
+			finalizeFilterProbes(ffmpegBin, &caps)
 			return caps
 		} else {
 			caps.probeNotes = append(caps.probeNotes, notes...)
@@ -1460,5 +1928,6 @@ func probeFFmpegCapabilities(ffmpegBin string) ffmpegCapabilities {
 		caps.probeNotes = append(caps.probeNotes, "no GPU devices detected (/dev/dri, /dev/nvidiactl); using software libx264")
 	}
 
+	finalizeFilterProbes(ffmpegBin, &caps)
 	return caps
 }

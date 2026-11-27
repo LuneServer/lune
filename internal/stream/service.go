@@ -116,7 +116,10 @@ type ActiveStream struct {
 	LastSeenAt            time.Time `json:"last_seen_at"`
 	MaxBitrate            int64     `json:"-"`
 	MaxHeight             int       `json:"-"`
+	VideoWidth            int       `json:"-"`
 	SourceHeight          int       `json:"-"`
+	Bitrate               int64     `json:"-"`
+	DurationMS            int64     `json:"-"`
 	VideoCodec            string    `json:"-"`
 	VideoProfile          string    `json:"-"`
 	VideoPixFmt           string    `json:"-"`
@@ -124,6 +127,10 @@ type ActiveStream struct {
 	DVProfile             int       `json:"-"`
 	DVCompatID            int       `json:"-"`
 	AudioCopy             bool      `json:"-"`
+	AudioCodec            string    `json:"-"`
+	AudioProfile          string    `json:"-"`
+	AudioTitle            string    `json:"-"`
+	AudioLanguage         string    `json:"-"`
 	AudioChannels         int       `json:"-"`
 	MaxAudioChannels      int       `json:"-"`
 	AudioStreamIndex      *int      `json:"-"`
@@ -390,11 +397,50 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		return PlaybackPlan{}, err
 	}
 
+	selectedAudioCodec := item.AudioCodec
+	selectedAudioChannels := item.AudioChannels
+	selectedAudioProfile := ""
+	selectedAudioTitle := ""
+	selectedAudioLanguage := selectedAudioLang
+	if selectedAudioTrack != nil {
+		if selectedAudioTrack.Codec != "" {
+			selectedAudioCodec = selectedAudioTrack.Codec
+		}
+		if selectedAudioTrack.Channels > 0 {
+			selectedAudioChannels = selectedAudioTrack.Channels
+		}
+		selectedAudioTitle = selectedAudioTrack.Title
+		if selectedAudioLanguage == "" {
+			selectedAudioLanguage = metadata.NormalizeLanguage(selectedAudioTrack.Language)
+		}
+		for _, st := range streams {
+			if st.Type == "audio" && st.Index == selectedAudioTrack.Index {
+				selectedAudioProfile = st.Profile
+				break
+			}
+		}
+	} else {
+		for _, st := range streams {
+			if st.Type == "audio" {
+				selectedAudioProfile = st.Profile
+				selectedAudioTitle = st.Title
+				if selectedAudioLanguage == "" {
+					selectedAudioLanguage = metadata.NormalizeLanguage(st.Language)
+				}
+				break
+			}
+		}
+	}
+
 	streamURL := "/stream/direct/" + token
 	mimeType := mimeForContainer(item.Container, item.FilePath)
 	hwAccel := ""
 	if mode != "direct" {
-		streamURL = "/stream/hls/" + token + "/index.m3u8"
+		if decision.audioCopy && isDolbyAtmosAudio(selectedAudioCodec, selectedAudioProfile, selectedAudioTitle) {
+			streamURL = "/stream/hls/" + token + "/master.m3u8"
+		} else {
+			streamURL = "/stream/hls/" + token + "/index.m3u8"
+		}
 		mimeType = "application/vnd.apple.mpegurl"
 		if mode == "transcode" {
 			hwAccel = string(s.transcoder.HWAccel())
@@ -428,10 +474,6 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 			break
 		}
 	}
-	selectedAudioChannels := item.AudioChannels
-	if selectedAudioTrack != nil && selectedAudioTrack.Channels > 0 {
-		selectedAudioChannels = selectedAudioTrack.Channels
-	}
 
 	s.active[sessionID] = &ActiveStream{
 		SessionID:             sessionID,
@@ -447,7 +489,10 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		LastSeenAt:            now,
 		MaxBitrate:            effectiveCaps.MaxBitrate,
 		MaxHeight:             effectiveCaps.MaxHeight,
+		VideoWidth:            item.VideoWidth,
 		SourceHeight:          item.VideoHeight,
+		Bitrate:               item.Bitrate,
+		DurationMS:            item.DurationMS,
 		VideoCodec:            item.VideoCodec,
 		VideoProfile:          videoProfile,
 		VideoPixFmt:           videoPixFmt,
@@ -455,6 +500,10 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		DVProfile:             dvProfile,
 		DVCompatID:            dvCompatID,
 		AudioCopy:             decision.audioCopy,
+		AudioCodec:            selectedAudioCodec,
+		AudioProfile:          selectedAudioProfile,
+		AudioTitle:            selectedAudioTitle,
+		AudioLanguage:         selectedAudioLanguage,
 		AudioChannels:         selectedAudioChannels,
 		MaxAudioChannels:      effectiveCaps.MaxAudioChannels,
 		AudioStreamIndex:      effectiveCaps.AudioStreamIndex,
@@ -696,7 +745,10 @@ func (s *Service) ServeHLS(w http.ResponseWriter, r *http.Request, token, fileNa
 	if ok {
 		opts.MaxBitrate = act.MaxBitrate
 		opts.MaxHeight = act.MaxHeight
+		opts.VideoWidth = act.VideoWidth
 		opts.SourceHeight = act.SourceHeight
+		opts.Bitrate = act.Bitrate
+		opts.DurationMS = act.DurationMS
 		opts.VideoCodec = act.VideoCodec
 		opts.VideoProfile = act.VideoProfile
 		opts.VideoPixFmt = act.VideoPixFmt
@@ -704,6 +756,10 @@ func (s *Service) ServeHLS(w http.ResponseWriter, r *http.Request, token, fileNa
 		opts.DVProfile = act.DVProfile
 		opts.DVCompatID = act.DVCompatID
 		opts.AudioCopy = act.AudioCopy
+		opts.AudioCodec = act.AudioCodec
+		opts.AudioProfile = act.AudioProfile
+		opts.AudioTitle = act.AudioTitle
+		opts.AudioLanguage = act.AudioLanguage
 		opts.AudioChannels = act.AudioChannels
 		opts.MaxAudioChannels = act.MaxAudioChannels
 		opts.AudioStreamIndex = act.AudioStreamIndex
@@ -714,6 +770,13 @@ func (s *Service) ServeHLS(w http.ResponseWriter, r *http.Request, token, fileNa
 	s.mu.Unlock()
 	if !ok {
 		http.Error(w, "stream session is no longer active", http.StatusUnauthorized)
+		return
+	}
+
+	if fileName == "master.m3u8" {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-cache")
+		_, _ = w.Write([]byte(buildMasterPlaylist(opts)))
 		return
 	}
 

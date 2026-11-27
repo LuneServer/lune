@@ -10,8 +10,16 @@ fi
 umask "${UMASK:-002}"
 
 # If the container was started with an explicit non-root `--user` / `user:` directive,
-# skip privilege dropping and ownership changes.
+# skip privilege dropping and ownership changes, but warn if /dev/dri is inaccessible.
 if [ "$(id -u)" -ne 0 ]; then
+  if [ -d /dev/dri ]; then
+    for dev in /dev/dri/renderD*; do
+      [ -e "$dev" ] || continue
+      if [ ! -r "$dev" ] || [ ! -w "$dev" ]; then
+        echo "lune entrypoint: warning: GPU device '$dev' is not readable/writable by uid=$(id -u) gid=$(id -g); use PUID/PGID env vars instead of --user or pass --group-add $(stat -c '%g' "$dev" 2>/dev/null || echo video)" >&2
+      fi
+    done
+  fi
   exec "$@"
 fi
 
@@ -44,7 +52,15 @@ if [ -d /dev/dri ]; then
   for dev in /dev/dri/renderD* /dev/dri/card*; do
     [ -e "$dev" ] || continue
     dev_gid="$(stat -c '%g' "$dev" 2>/dev/null || true)"
-    [ -n "$dev_gid" ] && [ "$dev_gid" != "0" ] || continue
+    [ -n "$dev_gid" ] || continue
+    if [ "$dev_gid" = "0" ]; then
+      # On Unraid and some NAS hosts, /dev/dri/renderD* may be owned by root:root (0660).
+      # Ensure the container-local device node is accessible to the unprivileged lune user.
+      if ! gosu lune test -r "$dev" || ! gosu lune test -w "$dev"; then
+        chmod a+rw "$dev" 2>/dev/null || echo "lune entrypoint: warning: '$dev' is owned by gid 0 and could not be made accessible to PUID=${PUID}; hardware transcoding may fall back to software" >&2
+      fi
+      continue
+    fi
     grp_name="$(getent group "$dev_gid" | cut -d: -f1 | head -n 1 || true)"
     if [ -z "$grp_name" ]; then
       grp_name="lune-dri-${dev_gid}"

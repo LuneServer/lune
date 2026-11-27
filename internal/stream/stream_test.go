@@ -288,7 +288,7 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 		}
 	}
 
-	// Remux with audio transcode must omit first_pts=0 so A/V stay locked with -avoid_negative_ts make_zero.
+	// Remux with audio transcode must omit first_pts=0 and use async=1000 + negative_cts_offsets so A/V stay locked.
 	remuxAACArgs := strings.Join(tr.buildFFmpegArgs("/media/4k.mkv", "/tmp/out", TranscodeOptions{
 		Mode:            "remux",
 		VideoCodec:      "hevc",
@@ -298,8 +298,11 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 	if !strings.Contains(remuxAACArgs, "-noaccurate_seek -ss 600.000") {
 		t.Fatalf("expected remux AAC args to use -noaccurate_seek -ss 600.000, got: %s", remuxAACArgs)
 	}
-	if !strings.Contains(remuxAACArgs, "-af aresample=async=1 ") || strings.Contains(remuxAACArgs, "first_pts=0") {
-		t.Fatalf("expected remux AAC args to use aresample=async=1 without first_pts=0, got: %s", remuxAACArgs)
+	if !strings.Contains(remuxAACArgs, "-af aresample=async=1000 ") || strings.Contains(remuxAACArgs, "first_pts=0") {
+		t.Fatalf("expected remux AAC args to use aresample=async=1000 without first_pts=0, got: %s", remuxAACArgs)
+	}
+	if !strings.Contains(remuxAACArgs, "-hls_segment_options movflags=+negative_cts_offsets") {
+		t.Fatalf("expected negative_cts_offsets in fMP4 HLS args, got: %s", remuxAACArgs)
 	}
 
 	// HDR10 transcode with PGS burn-in -> tone-map + scale2ref + overlay + yuv420p + BT.709 color tags + libx264 + keyframe alignment.
@@ -325,11 +328,17 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 		"-color_trc bt709",
 		"-colorspace bt709",
 		"-color_range tv",
+		"-fps_mode passthrough",
 		"-c:a aac",
+		"-af aresample=async=1000",
+		"-hls_segment_options movflags=+negative_cts_offsets",
 	} {
 		if !strings.Contains(burnArgs, want) {
 			t.Fatalf("expected burn-in transcode args to contain %q, got: %s", want, burnArgs)
 		}
+	}
+	if strings.Contains(burnArgs, "first_pts=0") {
+		t.Fatalf("expected transcode args to omit first_pts=0, got: %s", burnArgs)
 	}
 
 	// HDR10 transcode without zscale/libplacebo falls back to BT.2020->BT.709 matrix conversion + BT.709 SDR tags.
@@ -424,8 +433,8 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 		}
 	}
 
-	// fMP4 allowed file regex accepts init.mp4 and seg_00001.m4s, rejects traversal.
-	for _, valid := range []string{"index.m3u8", "init.mp4", "seg_00000.m4s", "seg_12345.ts"} {
+	// fMP4 allowed file regex accepts master.m3u8, index.m3u8, init.mp4 and seg_00001.m4s, rejects traversal.
+	for _, valid := range []string{"master.m3u8", "index.m3u8", "init.mp4", "seg_00000.m4s", "seg_12345.ts"} {
 		if !reAllowedHLSFile.MatchString(valid) {
 			t.Fatalf("expected %q to match reAllowedHLSFile", valid)
 		}
@@ -434,6 +443,143 @@ func TestBuildFFmpegArgs_fMP4_HEVC_HDR_And_BurnIn(t *testing.T) {
 		if reAllowedHLSFile.MatchString(invalid) {
 			t.Fatalf("expected %q to be rejected by reAllowedHLSFile", invalid)
 		}
+	}
+}
+
+func TestVODPlaylistAndMasterPlaylist(t *testing.T) {
+	// 10s remaining -> 4 segments (3s, 3s, 3s, 1s), VOD type, #EXT-X-ENDLIST.
+	pl := buildVODPlaylist(10_000)
+	for _, want := range []string{
+		"#EXTM3U",
+		"#EXT-X-PLAYLIST-TYPE:VOD",
+		"#EXT-X-MAP:URI=\"init.mp4\"",
+		"#EXTINF:3.000000,\nseg_00000.m4s",
+		"#EXTINF:3.000000,\nseg_00002.m4s",
+		"#EXTINF:1.000000,\nseg_00003.m4s",
+		"#EXT-X-ENDLIST",
+	} {
+		if !strings.Contains(pl, want) {
+			t.Fatalf("expected VOD playlist to contain %q, got:\n%s", want, pl)
+		}
+	}
+
+	// E-AC-3 Atmos remux master playlist declares ec-3 and CHANNELS="16/JOC".
+	master := buildMasterPlaylist(TranscodeOptions{
+		Mode:          "remux",
+		VideoCodec:    "hevc",
+		VideoProfile:  "Main 10",
+		VideoHDR:      "dovi_hdr10",
+		VideoWidth:    3840,
+		SourceHeight:  2160,
+		Bitrate:       25_000_000,
+		AudioCopy:     true,
+		AudioCodec:    "eac3",
+		AudioProfile:  "Dolby Digital Plus + Dolby Atmos",
+		AudioChannels: 6,
+		AudioLanguage: "en",
+		AudioTitle:    "English Atmos",
+	})
+	for _, want := range []string{
+		`#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English Atmos",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="16/JOC"`,
+		`CODECS="hvc1.2.4.L150.B0,ec-3",AUDIO="audio"`,
+		`RESOLUTION=3840x2160`,
+		"\nindex.m3u8\n",
+	} {
+		if !strings.Contains(master, want) {
+			t.Fatalf("expected master playlist to contain %q, got:\n%s", want, master)
+		}
+	}
+
+	// Seek-restarted VOD FFmpeg args include -output_ts_offset, -start_number, and ffmpeg.m3u8.
+	tr := &Transcoder{ffmpegBin: "/usr/bin/ffmpeg", hwAccel: HWAccelNone}
+	seekArgs := strings.Join(tr.buildFFmpegArgs("/media/movie.mkv", "/tmp/out", TranscodeOptions{
+		Mode:            "remux",
+		VideoCodec:      "hevc",
+		AudioCopy:       true,
+		DurationMS:      3_600_000,
+		StartPositionMS: 900_000,
+		StartSegment:    300,
+	}), " ")
+	for _, want := range []string{
+		"-output_ts_offset 900.000",
+		"-start_number 300",
+		"/tmp/out/ffmpeg.m3u8",
+	} {
+		if !strings.Contains(seekArgs, want) {
+			t.Fatalf("expected VOD seek args to contain %q, got: %s", want, seekArgs)
+		}
+	}
+}
+
+func TestVAAPIHybridHDRAndDownscaleBeforeTonemap(t *testing.T) {
+	// VA-API GPU without tonemap_vaapi (e.g. Intel Gen <= 10 or AMD Mesa):
+	// keeps GPU decode + GPU downscale via scale_vaapi BEFORE hwdownload + CPU zscale/tonemap.
+	trHybrid := &Transcoder{
+		ffmpegBin:        "/usr/bin/ffmpeg",
+		hwAccel:          HWAccelVAAPI,
+		vaapiDevice:      "/dev/dri/renderD128",
+		hasTonemapVAAPI:  false,
+		hasScaleVAAPI:    true,
+		hasZscaleTonemap: true,
+	}
+	hybridArgs := strings.Join(trHybrid.buildFFmpegArgs("/media/4k_hdr.mkv", "/tmp/out", TranscodeOptions{
+		Mode:         "transcode",
+		VideoCodec:   "hevc",
+		VideoHDR:     "hdr10",
+		SourceHeight: 2160,
+		MaxHeight:    1080,
+	}), " ")
+	for _, want := range []string{
+		"-hwaccel vaapi",
+		"-hwaccel_output_format vaapi",
+		"scale_vaapi=w=-2:h=1080,hwdownload,format=p010,zscale=t=linear:npl=100",
+		"format=nv12,hwupload",
+		"-c:v h264_vaapi",
+	} {
+		if !strings.Contains(hybridArgs, want) {
+			t.Fatalf("expected hybrid VA-API HDR args to contain %q, got: %s", want, hybridArgs)
+		}
+	}
+
+	// CPU fallback HDR transcode with downscale puts scale BEFORE zscale/tonemap.
+	trCPU := &Transcoder{
+		ffmpegBin:        "/usr/bin/ffmpeg",
+		hwAccel:          HWAccelNone,
+		hasZscaleTonemap: true,
+	}
+	cpuHDRArgs := strings.Join(trCPU.buildFFmpegArgs("/media/4k_hdr.mkv", "/tmp/out", TranscodeOptions{
+		Mode:         "transcode",
+		VideoCodec:   "hevc",
+		VideoHDR:     "hdr10",
+		SourceHeight: 2160,
+		MaxHeight:    1080,
+	}), " ")
+	scaleIdx := strings.Index(cpuHDRArgs, "scale=trunc(oh*dar/2)*2:min(ih\\,1080),setsar=1")
+	zscaleIdx := strings.Index(cpuHDRArgs, "zscale=t=linear:npl=100")
+	if scaleIdx < 0 || zscaleIdx < 0 || scaleIdx > zscaleIdx {
+		t.Fatalf("expected scale before zscale/tonemap in CPU HDR fallback, got: %s", cpuHDRArgs)
+	}
+
+	// VA-API with verified tonemap_vaapi prefers tonemap_vaapi over libplacebo for dovi_hdr10.
+	trVAAPIDV := &Transcoder{
+		ffmpegBin:       "/usr/bin/ffmpeg",
+		hwAccel:         HWAccelVAAPI,
+		vaapiDevice:     "/dev/dri/renderD128",
+		hasTonemapVAAPI: true,
+		hasScaleVAAPI:   true,
+		hasLibplacebo:   true,
+	}
+	dvHDR10Args := strings.Join(trVAAPIDV.buildFFmpegArgs("/media/dv8.mkv", "/tmp/out", TranscodeOptions{
+		Mode:         "transcode",
+		VideoCodec:   "hevc",
+		VideoHDR:     "dovi_hdr10",
+		DVProfile:    8,
+		DVCompatID:   1,
+		SourceHeight: 2160,
+		MaxHeight:    1080,
+	}), " ")
+	if strings.Contains(dvHDR10Args, "libplacebo") || !strings.Contains(dvHDR10Args, "tonemap_vaapi=") {
+		t.Fatalf("expected VA-API with tonemap_vaapi to prefer tonemap_vaapi for dovi_hdr10, got: %s", dvHDR10Args)
 	}
 }
 
