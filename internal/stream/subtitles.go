@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
 
 var (
 	reSRTTimestamp = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})(\s+-->\s+)(\d{2}:\d{2}:\d{2}),(\d{3})`)
+	reASSTags      = regexp.MustCompile(`\{[^}]*\}`)
 	reASSDrawing   = regexp.MustCompile(`\\p[1-9]`)
 )
 
@@ -25,6 +27,95 @@ func SRTToWebVTT(raw []byte) []byte {
 	var out bytes.Buffer
 	out.WriteString("WEBVTT\n\n")
 	out.WriteString(strings.TrimLeft(converted, "\n"))
+	return out.Bytes()
+}
+
+type assCue struct {
+	startMS int64
+	endMS   int64
+	text    string
+}
+
+// ASSToWebVTT converts SubStation Alpha (.ass / .ssa) subtitle scripts commonly used in anime
+// into standards-compliant WebVTT without invoking FFmpeg.
+func ASSToWebVTT(raw []byte) []byte {
+	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
+	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+
+	inEvents := false
+	startCol, endCol, textCol, totalCols := 1, 2, 9, 10
+	var cues []assCue
+
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, ";") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inEvents = strings.EqualFold(trimmed, "[Events]")
+			continue
+		}
+		if !inEvents {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(trimmed), "format:") {
+			fields := strings.Split(trimmed[len("format:"):], ",")
+			totalCols = len(fields)
+			for i, f := range fields {
+				switch strings.ToLower(strings.TrimSpace(f)) {
+				case "start":
+					startCol = i
+				case "end":
+					endCol = i
+				case "text":
+					textCol = i
+				}
+			}
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(trimmed), "dialogue:") {
+			continue
+		}
+		payload := strings.TrimSpace(trimmed[len("dialogue:"):])
+		cols := strings.SplitN(payload, ",", totalCols)
+		if len(cols) <= textCol || len(cols) <= startCol || len(cols) <= endCol {
+			continue
+		}
+		startMS, ok1 := parseASSTime(cols[startCol])
+		endMS, ok2 := parseASSTime(cols[endCol])
+		if !ok1 || !ok2 || endMS <= startMS {
+			continue
+		}
+		rawDialogue := cols[textCol]
+		// Skip vector drawing commands (e.g. {\p1}m 0 0 l 100 100...) used for typesetting shapes.
+		if reASSDrawing.MatchString(rawDialogue) {
+			continue
+		}
+		clean := cleanASSText(rawDialogue)
+		if clean == "" {
+			continue
+		}
+		cues = append(cues, assCue{startMS: startMS, endMS: endMS, text: clean})
+	}
+
+	sort.SliceStable(cues, func(i, j int) bool {
+		if cues[i].startMS != cues[j].startMS {
+			return cues[i].startMS < cues[j].startMS
+		}
+		return cues[i].endMS < cues[j].endMS
+	})
+
+	var out bytes.Buffer
+	out.WriteString("WEBVTT\n\n")
+	for _, c := range cues {
+		out.WriteString(formatVTTTime(c.startMS))
+		out.WriteString(" --> ")
+		out.WriteString(formatVTTTime(c.endMS))
+		out.WriteByte('\n')
+		out.WriteString(c.text)
+		out.WriteString("\n\n")
+	}
 	return out.Bytes()
 }
 
@@ -71,4 +162,18 @@ func formatVTTTime(ms int64) string {
 	s := ms / 1000
 	rem := ms % 1000
 	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, rem)
+}
+
+func cleanASSText(raw string) string {
+	s := reASSTags.ReplaceAllString(raw, "")
+	s = strings.NewReplacer(`\N`, "\n", `\n`, "\n", `\h`, " ").Replace(s)
+	lines := strings.Split(s, "\n")
+	var kept []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			kept = append(kept, l)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
