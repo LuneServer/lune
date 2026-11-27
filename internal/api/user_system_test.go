@@ -181,6 +181,28 @@ func TestUserSystemSelfServiceProfilePasswordAvatarAndSessions(t *testing.T) {
 		t.Fatalf("unexpected updated profile: %+v", prof)
 	}
 
+	// 2b. show_chapter_markers round-trips through PATCH and GET.
+	rec = doJSON(t, h, http.MethodPatch, "/api/v1/users/me", map[string]any{
+		"preferences": map[string]any{"autoplay_next": true, "subtitles_enabled": false, "show_chapter_markers": false},
+	}, adminCookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH show_chapter_markers status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodGet, "/api/v1/users/me", nil, adminCookie, "")
+	prof = UserProfileDTO{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &prof)
+	if prof.Preferences.ShowChapterMarkers {
+		t.Fatalf("show_chapter_markers = true after disabling: %+v", prof.Preferences)
+	}
+	rec = doJSON(t, h, http.MethodPatch, "/api/v1/users/me", map[string]any{
+		"preferences": map[string]any{"autoplay_next": true, "subtitles_enabled": false, "show_chapter_markers": true},
+	}, adminCookie, "")
+	prof = UserProfileDTO{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &prof)
+	if !prof.Preferences.ShowChapterMarkers {
+		t.Fatalf("show_chapter_markers = false after re-enabling: %+v", prof.Preferences)
+	}
+
 	// 3. Avatar upload (rejects invalid MIME, accepts PNG via multipart, serves image, deletes).
 	badReq := httptest.NewRequest(http.MethodPut, "/api/v1/users/me/avatar", bytes.NewReader([]byte("not-an-image")))
 	badReq.AddCookie(adminCookie)
