@@ -39,6 +39,7 @@ var (
 	reSpecialsFolder  = regexp.MustCompile(`(?i)^(?:specials?|season\s*0+|ovas?|oads?|extras?|bonus)$`)
 	reMoviesFolder    = regexp.MustCompile(`(?i)^(?:movies?|films?|theatrical)$`)
 	reOrdinalSeason   = regexp.MustCompile(`(?i)\s+(?:(\d{1,2})(?:st|nd|rd|th)\s+season|season\s+(\d{1,2})|s(\d{1,2}))\s*$`)
+	reLeadingEpToken  = regexp.MustCompile(`(?i)^(?:#|(?:e|ep\.?|episode)\s*)?(\d{1,4})(?:v\d+)?(?:\s*[-–—.:)]\s*|\s+|$)`)
 	reTechBracketTag  = regexp.MustCompile(`(?i)^(?:2160p|1080p|720p|480p|bd|bdrip|web-?dl|webrip|hevc|x265|x264|av1|10bit|8bit|hi10p|flac|aac|opus|dual[\s._-]?audio|multi[\s._-]?sub|[0-9a-f]{8})$`)
 )
 
@@ -151,7 +152,7 @@ func parseEpisode(rootPath, fullPath, base string) ParsedFile {
 			rawPrefix = stripYearFromTitle(rawPrefix)
 		}
 		prefix := cleanTitle(rawPrefix)
-		suffix := cleanTitle(reQualityTail.ReplaceAllString(stripAnimeMeta(base[m[1]:]), ""))
+		suffix := cleanEpisodeTitle(base[m[1]:], out.EpisodeNumber)
 		if prefix != "" {
 			out.SeriesTitle = prefix
 		}
@@ -219,7 +220,7 @@ func parseAnime(rootPath, fullPath, base string) ParsedFile {
 			out.EpisodeNumber = &e
 		}
 		prefix := stripYearFromTitle(cleanWork[:m[0]])
-		suffix := cleanTitle(reQualityTail.ReplaceAllString(cleanWork[m[1]:], ""))
+		suffix := cleanEpisodeTitle(cleanWork[m[1]:], out.EpisodeNumber)
 		out.SeriesTitle = cleanAnimeSeriesTitle(prefix)
 		if suffix != "" {
 			out.Title = suffix
@@ -241,7 +242,7 @@ func parseAnime(rootPath, fullPath, base string) ParsedFile {
 			out.EpisodeNumber = &e
 		}
 		prefix := stripYearFromTitle(cleanWork[:m[0]])
-		suffix := cleanTitle(reQualityTail.ReplaceAllString(cleanWork[m[1]:], ""))
+		suffix := cleanEpisodeTitle(cleanWork[m[1]:], out.EpisodeNumber)
 		out.SeriesTitle = cleanAnimeSeriesTitle(prefix)
 		if suffix != "" {
 			out.Title = suffix
@@ -267,7 +268,7 @@ func parseAnime(rootPath, fullPath, base string) ParsedFile {
 			prefix := stripYearFromTitle(cleanWork[:m[0]])
 			out.SeriesTitle = cleanAnimeSeriesTitle(prefix)
 			specLabel := strings.TrimSpace(cleanWork[m[0]:m[1]])
-			tail := cleanTitle(reQualityTail.ReplaceAllString(cleanWork[m[1]:], ""))
+			tail := cleanEpisodeTitle(cleanWork[m[1]:], out.EpisodeNumber)
 			if tail != "" {
 				out.Title = specLabel + " - " + tail
 			} else {
@@ -313,7 +314,7 @@ func parseAnime(rootPath, fullPath, base string) ParsedFile {
 
 				epTitle := ""
 				if len(m) >= 4 {
-					epTitle = cleanTitle(m[3])
+					epTitle = cleanEpisodeTitle(m[3], &epNum)
 				}
 				if epTitle != "" {
 					out.Title = epTitle
@@ -348,7 +349,7 @@ func parseAnime(rootPath, fullPath, base string) ParsedFile {
 				}
 				epTitle := ""
 				if len(m) >= 4 {
-					epTitle = cleanTitle(m[3])
+					epTitle = cleanEpisodeTitle(m[3], &epNum)
 				}
 				if epTitle != "" {
 					out.Title = epTitle
@@ -383,7 +384,7 @@ func parseAnime(rootPath, fullPath, base string) ParsedFile {
 					}
 					epTitle := ""
 					if len(m) >= 3 {
-						epTitle = cleanTitle(m[2])
+						epTitle = cleanEpisodeTitle(m[2], &epNum)
 					}
 					if epTitle != "" {
 						out.Title = epTitle
@@ -680,6 +681,70 @@ func cleanTitle(raw string) string {
 	s = strings.TrimSpace(strings.Trim(s, "-–— "))
 	s = reSpaces.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
+}
+
+// releaseTailTokens are source/subtitle tags that release names leave after an episode title
+// once resolution and codec tags are cut (e.g. "Title CR MULTi", "Title AMZN WEB").
+var releaseTailTokens = map[string]bool{
+	"cr": true, "amzn": true, "nf": true, "dsnp": true, "hulu": true, "atvp": true, "adn": true,
+	"hidi": true, "hidive": true, "b-global": true, "bglobal": true, "bilibili": true, "funi": true,
+	"web": true, "webdl": true, "multi": true, "multisub": true, "multisubs": true, "msub": true,
+	"msubs": true, "esub": true, "esubs": true, "dual": true, "raw": true, "proper": true, "repack": true,
+	"subsplus": true, "subsplease": true,
+}
+
+// cleanEpisodeTitle turns the text a filename carries after its episode number into a display
+// title. It removes release metadata (bracket/brace/paren tags, resolution and codec tails,
+// "+"-joined release tags such as "+SubsPlus-", trailing source tags such as "CR MULTi") and a
+// leading episode number ("001 - Title", "E01 Title", "#01 Title"). A leading number is only
+// treated as an episode number when it is zero-padded, prefixed with #/E/Ep/Episode, or equal
+// to one of epNums, so titles such as "1000 Years Later" survive. It returns "" when nothing
+// but release metadata remains.
+func cleanEpisodeTitle(raw string, epNums ...*int) string {
+	s := cleanTitle(reQualityTail.ReplaceAllString(stripAnimeMeta(raw), ""))
+	if s == "" {
+		return ""
+	}
+	fields := strings.Fields(s)
+	kept := fields[:0]
+	for _, f := range fields {
+		if strings.Contains(f, "+") {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	for len(kept) > 0 {
+		last := strings.ToLower(strings.Trim(kept[len(kept)-1], "-–—:,"))
+		if last != "" && !releaseTailTokens[last] {
+			break
+		}
+		kept = kept[:len(kept)-1]
+	}
+	s = strings.TrimSpace(strings.Trim(strings.Join(kept, " "), "-–—:,. "))
+
+	for i := 0; i < 2 && s != ""; i++ {
+		m := reLeadingEpToken.FindStringSubmatchIndex(s)
+		if m == nil {
+			break
+		}
+		num := s[m[2]:m[3]]
+		strip := m[2] > 0 || (len(num) > 1 && num[0] == '0')
+		if !strip {
+			if n, err := strconv.Atoi(num); err == nil {
+				for _, ep := range epNums {
+					if ep != nil && *ep == n {
+						strip = true
+						break
+					}
+				}
+			}
+		}
+		if !strip {
+			break
+		}
+		s = strings.TrimSpace(strings.Trim(s[m[1]:], "-–—:,. "))
+	}
+	return s
 }
 
 func makeSortTitle(title string) string {

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,7 +56,9 @@ const (
 	// CurrentMetadataVersion is bumped whenever parser, scanner, or enricher logic changes
 	// (e.g. credits, cast, content rating, release date, IMDb IDs, or Sonarr/TV year & group parsing)
 	// so incremental scans and startup backfill automatically upgrade previously indexed items.
-	CurrentMetadataVersion = 3
+	// v4: TMDB episode names replace filename-derived episode titles, and fallback titles drop
+	// release junk and leading episode numbers.
+	CurrentMetadataVersion = 4
 )
 
 // Service coordinates media library configuration, incremental scanning, and catalog queries.
@@ -519,6 +522,14 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 		s.incScan(lib.ID, func(st *ScanStatus) { st.Removed += int(removed) })
 	}
 
+	// Merge differently spelled series titles of one show (same TMDB series, or the same
+	// normalised title) so episodes from mixed releases group into a single series.
+	if renamed, err := s.store.CanonicalizeSeriesTitles(ctx, lib.ID); err != nil {
+		s.logger.Warn("failed to merge series titles", "library", lib.Name, "error", err)
+	} else if renamed > 0 {
+		s.logger.Info("merged series title variants", "library", lib.Name, "episodes", renamed)
+	}
+
 	st := s.GetScanStatus(lib.ID)
 	if st.Added+st.Updated+st.Removed >= 50 {
 		_ = s.store.Optimize(ctx)
@@ -620,8 +631,10 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 	}
 
 	// 1. Offline local NFO sidecar enrichment (Kodi/Radarr/Sonarr XML, including parent tvshow.nfo for episodes).
+	titleFromNFO := false
 	if nfo, ok := metadata.ParseLocalNFOForKind(lib.RootPath, job.path, item.Kind); ok {
 		if nfo.Title != "" {
+			titleFromNFO = true
 			item.Title = nfo.Title
 			item.SortTitle = makeSortTitle(nfo.Title)
 		}
@@ -723,7 +736,7 @@ func (s *Service) buildScannedItem(ctx context.Context, lib store.Library, job d
 			}
 			if err == nil {
 				item.MetadataVersion = CurrentMetadataVersion
-				if item.Kind == "episode" && remote.Title != "" && isGenericEpisodeTitle(item.Title) {
+				if item.Kind == "episode" && preferRemoteEpisodeTitle(item.Title, remote.Title, titleFromNFO) {
 					item.Title = remote.Title
 				}
 				if item.OriginalTitle == "" && remote.OriginalTitle != "" {
@@ -1068,7 +1081,29 @@ func isEnrichableLibraryKind(kind string) bool {
 	return kind == "movies" || kind == "shows" || kind == "anime"
 }
 
+var reGenericEpisodeTitle = regexp.MustCompile(`(?i)^(?:S\d{1,2}E\d{1,4}|(?:episode|ep\.?|e|#)?\s*\d{1,4}|(?:OVA|OAD|ONA|Special|SP|NCOP|NCED|PV)(?:\s*\d{1,3})?)$`)
+
+// isGenericEpisodeTitle reports placeholder titles such as "S01E02", "Episode 02", "001", or
+// "OVA 01" that carry no episode name.
 func isGenericEpisodeTitle(title string) bool {
-	u := strings.ToUpper(strings.TrimSpace(title))
-	return u == "" || strings.HasPrefix(u, "S") && strings.Contains(u, "E") || strings.HasPrefix(u, "EPISODE ")
+	t := strings.TrimSpace(title)
+	return t == "" || reGenericEpisodeTitle.MatchString(t)
+}
+
+// preferRemoteEpisodeTitle decides whether a matched TMDB episode name replaces the title an
+// episode got from its filename. TMDB wins over filename text, which is often release junk or
+// a fansub's own translation; an explicit .nfo <title> is kept. A placeholder TMDB name such as
+// "Episode 5" never replaces a real local title.
+func preferRemoteEpisodeTitle(local, remote string, localFromNFO bool) bool {
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		return false
+	}
+	if isGenericEpisodeTitle(local) {
+		return true
+	}
+	if localFromNFO || isGenericEpisodeTitle(remote) {
+		return false
+	}
+	return true
 }
