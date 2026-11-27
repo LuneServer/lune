@@ -1114,7 +1114,7 @@ func (t *Transcoder) ExtractSubtitleVTT(ctx context.Context, cacheKey, inputPath
 		"-vn", "-an", "-dn",
 	}
 	if assSource {
-		args = append(args, "-c:s", assOutputCodec(codec), "-f", "ass", "pipe:1")
+		args = append(args, "-c:s", assOutputCodec(codec), "-ignore_readorder", "1", "-f", "ass", "pipe:1")
 	} else {
 		args = append(args, "-f", "webvtt", tmp)
 	}
@@ -1186,8 +1186,10 @@ func (t *Transcoder) StreamSubtitleVTT(ctx context.Context, w http.ResponseWrite
 	if assSource {
 		// ASS/SSA is converted in Go (StreamASSToWebVTT) so karaoke is flattened, typeset signs
 		// are grouped into single cues and placement is clamped; FFmpeg's WebVTT muxer emits
-		// inline karaoke timestamps and one cue per event.
-		args = append(args, "-c:s", assOutputCodec(codec), "-f", "ass", "pipe:1")
+		// inline karaoke timestamps and one cue per event. -ignore_readorder keeps events in
+		// time order: by default the muxer restores the script's line order, which can jump
+		// back many minutes and breaks the converter's progressive grouping.
+		args = append(args, "-c:s", assOutputCodec(codec), "-ignore_readorder", "1", "-f", "ass", "pipe:1")
 	} else {
 		args = append(args, "-f", "webvtt", "pipe:1")
 	}
