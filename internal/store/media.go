@@ -965,6 +965,59 @@ func (s *Store) GetLibraryFacets(ctx context.Context, libraryID string) (Library
 	return facets, nil
 }
 
+// ChapterSourceItem holds the minimal fields required to generate chapter still thumbnails.
+type ChapterSourceItem struct {
+	ID           string
+	Title        string
+	FilePath     string
+	FileMtime    int64
+	VideoHDR     string
+	ChaptersJSON string
+}
+
+// ListItemsWithChapters returns all indexed media items that have non-empty chapter metadata.
+func (s *Store) ListItemsWithChapters(ctx context.Context) ([]ChapterSourceItem, error) {
+	rows, err := s.reader.QueryContext(ctx, `
+		SELECT id, title, file_path, file_mtime, video_hdr, chapters_json
+		FROM media_items
+		WHERE chapters_json != '' AND chapters_json != '[]'
+		ORDER BY created_at DESC, id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ChapterSourceItem
+	for rows.Next() {
+		var item ChapterSourceItem
+		if err := rows.Scan(&item.ID, &item.Title, &item.FilePath, &item.FileMtime, &item.VideoHDR, &item.ChaptersJSON); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// ListAllMediaItemIDs returns the set of all live media_items IDs.
+func (s *Store) ListAllMediaItemIDs(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := s.reader.QueryContext(ctx, `SELECT id FROM media_items`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = struct{}{}
+	}
+	return ids, rows.Err()
+}
+
 // HasIndexedPersonPhoto reports whether filename is referenced in any indexed media item's cast_json.
 func (s *Store) HasIndexedPersonPhoto(ctx context.Context, filename string) (bool, error) {
 	if filename == "" {

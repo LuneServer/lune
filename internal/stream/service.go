@@ -134,6 +134,7 @@ type ActiveStream struct {
 // Service manages playback negotiation, signed Direct Play, HLS transcoding, and watch progress.
 type Service struct {
 	store      *store.Store
+	dataDir    string
 	transcoder *Transcoder
 	secret     []byte
 	logger     *slog.Logger
@@ -177,6 +178,7 @@ func NewService(ctx context.Context, s *store.Store, dataDir string, logger *slo
 
 	return &Service{
 		store:      s,
+		dataDir:    dataDir,
 		transcoder: transcoder,
 		secret:     secret,
 		logger:     logger,
@@ -303,6 +305,7 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 	if chapters == nil {
 		chapters = []metadata.ChapterInfo{}
 	}
+	metadata.PopulateChapterThumbnails(s.dataDir, item.ID, chapters)
 
 	// Build full subtitle list (sidecar + embedded text tracks when FFmpeg is available).
 	// Token is needed for URLs, so first compute preferred audio track to decide playback mode.

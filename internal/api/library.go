@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -199,7 +202,7 @@ type SearchMetadataResponse struct {
 	}
 }
 
-func registerLibraryRoutes(r chi.Router, api huma.API, libSvc *library.Service, authSvc *auth.Service, streamSvc *stream.Service) {
+func registerLibraryRoutes(r chi.Router, api huma.API, libSvc *library.Service, authSvc *auth.Service, streamSvc *stream.Service, dataDir string) {
 	huma.Register(api, huma.Operation{
 		OperationID: "list-libraries",
 		Method:      http.MethodGet,
@@ -405,6 +408,7 @@ func registerLibraryRoutes(r chi.Router, api huma.API, libSvc *library.Service, 
 
 	enrichItemDetail := func(ctx context.Context, user store.User, item store.MediaItem) MediaItemDetailDTO {
 		detail := toMediaDetailDTO(item)
+		metadata.PopulateChapterThumbnails(dataDir, item.ID, detail.Chapters)
 		if user.Role == "admin" {
 			detail.FilePath = item.FilePath
 		}
@@ -547,6 +551,44 @@ func registerLibraryRoutes(r chi.Router, api huma.API, libSvc *library.Service, 
 			return nil, mapLibraryError(err)
 		}
 		return &ItemDetailResponse{Body: enrichItemDetail(ctx, user, item)}, nil
+	})
+
+	// Binary chapter still thumbnail endpoint (enforces auth + per-user library ACL).
+	r.Get("/api/v1/items/{id}/artwork/chapters/{index}", func(w http.ResponseWriter, req *http.Request) {
+		user, _, ok := currentPrincipal(req.Context())
+		if !ok {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		rawIndex := chi.URLParam(req, "index")
+		idx, err := strconv.Atoi(rawIndex)
+		if err != nil || idx < 0 || strconv.Itoa(idx) != rawIndex {
+			http.NotFound(w, req)
+			return
+		}
+		item, err := libSvc.GetItem(req.Context(), chi.URLParam(req, "id"))
+		if err != nil {
+			http.NotFound(w, req)
+			return
+		}
+		allowed, err := authSvc.CanAccessLibrary(req.Context(), user, item.LibraryID)
+		if err != nil || !allowed {
+			http.Error(w, "access to this library is restricted", http.StatusForbidden)
+			return
+		}
+		if dataDir == "" {
+			http.NotFound(w, req)
+			return
+		}
+		stillPath := filepath.Join(dataDir, "artwork", "chapters", item.ID, strconv.Itoa(idx)+".jpg")
+		info, err := os.Stat(stillPath)
+		if err != nil || info.IsDir() {
+			http.NotFound(w, req)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Cache-Control", "private, max-age=604800")
+		http.ServeFile(w, req, stillPath)
 	})
 
 	// Binary local artwork endpoint (strictly serves indexed poster/backdrop files).

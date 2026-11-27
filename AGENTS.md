@@ -57,7 +57,7 @@ lune/
 │   │   ├── series.go            # Series list, detail with progress, Up Next episode resolution
 │   │   ├── subtitles.go         # Local sidecar subtitle discovery (.vtt, .srt, .ass, .ssa; language/forced/Signs & Songs detection)
 │   │   └── watcher.go           # fsnotify debounced (5s) watcher + periodic fallback scan (for FUSE/Unraid)
-│   ├── maintenance/             # Guarded periodic & manual housekeeping (orphaned artwork, stale transcode/sub cache, audit log pruning, SQLite optimize/checkpoint) with live-reconfigurable server_settings["maintenance_config"]
+│   ├── maintenance/             # Guarded periodic & manual housekeeping (orphaned artwork incl. chapter stills, stale transcode/sub cache, audit log pruning, sequential chapter still generation, SQLite optimize/checkpoint) with live-reconfigurable server_settings["maintenance_config"]
 │   ├── metadata/                # Technical probing & descriptive enrichment
 │   │   ├── probe.go             # ffprobe wrapper extracting container, duration, bitrate, video/audio/sub streams, MKV chapters (OP/ED/Recap/Preview), normalized audio languages
 │   │   ├── nfo.go               # Local Kodi/Jellyfin-style .nfo XML parser (including `<originaltitle>`)
@@ -79,7 +79,7 @@ lune/
 │   │   ├── maintenance.go       # Admin housekeeping status, live config, and manual run endpoints (GET /api/v1/admin/maintenance, PUT /api/v1/admin/maintenance/config, POST /api/v1/admin/maintenance/run)
 │   │   ├── users.go             # Self-service profile/password/prefs/avatars/watchlist/favorites (/api/v1/users/*) & admin user/session management (/api/v1/admin/users/*)
 │   │   ├── invites.go           # Admin invite management (/api/v1/admin/invites) & public invite inspection/acceptance (/api/v1/invites/*)
-│   │   ├── library.go           # Libraries, scans, items (+ genre/person/studio filtering, pre-play tracks/progress, /similar local matching), /api/v1/metadata/search (admin visual identify), refresh (with explicit tmdb_id binding), binary artwork endpoint (enforcing library ACLs)
+│   │   ├── library.go           # Libraries, scans, items (+ genre/person/studio filtering, pre-play tracks/progress, /similar local matching), /api/v1/metadata/search (admin visual identify), refresh (with explicit tmdb_id binding), binary poster/backdrop and chapter still artwork endpoints (enforcing library ACLs)
 │   │   ├── series.go            # Series list/detail (with synopsis/marks/watched_count), /api/v1/series/watched, /api/v1/series/refresh, and /api/v1/items/{id}/next
 │   │   ├── requests.go          # Native Media Requests endpoints (/api/v1/requests/* and /api/v1/admin/requests/*)
 │   │   └── playback.go          # Playback negotiation, signed direct-link/download (/api/v1/items/{id}/direct-link), progress, continue watching (/api/v1/playback/continue), next up (/api/v1/playback/next-up), active streams, admin streaming config (GET/PUT /api/v1/admin/streaming/config), /stream/*
@@ -136,7 +136,7 @@ All configuration is environment-driven:
 ### HTTP & OpenAPI Layer (`internal/api`, `internal/web`)
 - **Middleware order** in `api.NewHandler`: `RequestID` -> `Recoverer` -> `security.BodyLimitMiddleware` -> `security.HeadersMiddleware` -> `security.EdgeGuardMiddleware` -> `security.CompressMiddleware` -> `requestMetaMiddleware` -> `adminLANOnlyMiddleware` -> `csrfMiddleware` -> `optionalAuthMiddleware`.
 - **Auth enforcement:** `optionalAuthMiddleware` resolves `Authorization: Bearer <token>` or the `lune_session` HttpOnly cookie into request context. Handlers explicitly check `currentPrincipal(ctx)` for 401 and `user.Role != "admin"` for 403.
-- **Typed JSON endpoints vs. raw Chi routes:** Use `huma.Register` for all JSON API endpoints so `/openapi.json` stays canonical. Use raw `chi.Router` routes only for binary/streaming responses (`/api/v1/items/{id}/artwork/{kind}`, `/api/v1/artwork/people/{file}`, `/api/v1/users/me/avatar`, `/api/v1/users/{id}/avatar`, `/stream/direct/{token}`, `/stream/hls/{token}/{file}`, `/stream/sub/{token}/{file}`).
+- **Typed JSON endpoints vs. raw Chi routes:** Use `huma.Register` for all JSON API endpoints so `/openapi.json` stays canonical. Use raw `chi.Router` routes only for binary/streaming responses (`/api/v1/items/{id}/artwork/{kind}`, `/api/v1/items/{id}/artwork/chapters/{index}`, `/api/v1/artwork/people/{file}`, `/api/v1/users/me/avatar`, `/api/v1/users/{id}/avatar`, `/stream/direct/{token}`, `/stream/hls/{token}/{file}`, `/stream/sub/{token}/{file}`).
 - **SPA safety:** `web.NewSPAHandler` must never hijack `/api/`, `/stream/`, `/healthz`, `/docs`, or `/openapi.*`.
 - **No write timeout:** `edge.Server` deliberately leaves `http.Server.WriteTimeout` at `0` so long-lived media streams are never prematurely terminated.
 
@@ -164,6 +164,7 @@ All configuration is environment-driven:
 - Playback negotiation chooses the cheapest valid path: `direct` (HTTP Range `ServeContent`) -> `remux` (zero-transcode fMP4 HLS with `-c:v copy`, `-tag:v hvc1` for 4K HEVC, and `-c:a copy` when the selected audio track is already client-compatible fMP4 audio) -> `transcode` (fMP4 HLS with detected `videotoolbox` / `nvenc` / `vaapi` / `qsv` / `software` `libx264`, automatic HW-to-SW fallback on startup failure, `-pix_fmt yuv420p` for 10-bit sources, `libplacebo` Dolby Vision tone-mapping with automatic `zscale`/`tonemap` HDR-to-SDR fallback when available, 3s keyframe alignment, and optional FFmpeg `overlay` burn-in for PGS/VobSub/DVB bitmap subtitles). Selecting the primary (first) audio track avoids unnecessary remuxing, and 10-bit H.264 / unsupported HDR / Dolby Vision profiles automatically negotiate transcoding.
 - HLS segment names are strictly validated (`^(index\.m3u8|init\.mp4|seg_\d{5}\.(m4s|ts))$`) to prevent path traversal, and embedded text subtitle extraction uses per-track singleflight deduplication with `-vn -an -dn`.
 - Stream tokens expire after 6h and bind `sid`, `uid`, `iid`, and `mode`.
+- **Chapter Still Thumbnails:** Maintenance (`generate_chapter_thumbnails`, default `true`) sequentially generates 480px JPEG chapter stills via single-threaded FFmpeg (with HDR tone-mapping + SDR fallback, capped at 200 items/run, yielding immediately when a scan or transcode is active) into `<DataDir>/artwork/chapters/<item_id>/<index>.jpg` via atomic `.tmp.jpg` renames and prunes stale chapter indices. `cleanOrphanedArtwork` preserves live item chapter directories while removing orphaned ones. `GET /api/v1/items/{id}` and `POST /api/v1/items/{id}/playback` populate `ChapterInfo.thumbnail_url` (`/api/v1/items/{id}/artwork/chapters/{index}`) via a single `os.ReadDir` only for stills present on disk, served with library ACL enforcement and `Cache-Control: private, max-age=604800`.
 - Completing an item (`UpsertPlaybackProgress` with `completed = true`, automatically at ≥92% or explicitly marked watched) atomically removes it from the user's Watchlist while preserving Favorites.
 
 ---

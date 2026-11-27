@@ -215,7 +215,7 @@ func NewHandler(deps Dependencies) http.Handler {
 	registerInviteRoutes(api, runtimeNet, deps.Auth)
 	registerNetworkAdminRoutes(api, deps.Config, deps.Store, runtimeNet)
 	registerMaintenanceAdminRoutes(api, deps.Maintenance, deps.Store)
-	registerLibraryRoutes(r, api, deps.Library, deps.Auth, deps.Stream)
+	registerLibraryRoutes(r, api, deps.Library, deps.Auth, deps.Stream, deps.Config.DataDir)
 	registerSeriesRoutes(api, deps.Library, deps.Auth)
 	registerRequestRoutes(api, deps.Requests)
 	if deps.Stream != nil {
