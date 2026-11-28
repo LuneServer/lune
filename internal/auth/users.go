@@ -401,6 +401,16 @@ func (s *Service) UpdateSelfProfile(ctx context.Context, actor store.User, displ
 		if p.MaxBitrate < 0 {
 			return UserDetail{}, fmt.Errorf("%w: max_bitrate must be >= 0", ErrValidation)
 		}
+		for name, mode := range map[string]string{
+			"auto_skip_intro":   p.AutoSkipIntro,
+			"auto_skip_recap":   p.AutoSkipRecap,
+			"auto_skip_credits": p.AutoSkipCredits,
+		} {
+			if strings.TrimSpace(mode) != "" && store.NormalizeAutoSkip(mode, "") == "" {
+				return UserDetail{}, fmt.Errorf("%w: %s must be off, countdown or instant", ErrValidation, name)
+			}
+		}
+		p.NormalizeAutoSkipModes()
 		if len(p.PosterBadges) > 0 {
 			seen := make(map[string]struct{}, len(p.PosterBadges))
 			cleaned := make([]string, 0, len(p.PosterBadges))

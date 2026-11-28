@@ -28,6 +28,37 @@ type UserPreferences struct {
 	ShowChapterMarkers bool     `json:"show_chapter_markers" required:"false"`
 	PosterBadges       []string `json:"poster_badges,omitempty" required:"false"`
 	MaxBitrate         int64    `json:"max_bitrate,omitempty"`
+	// Auto-skip behaviour for PlaybackPlan.segments: "off" (show the Skip button only),
+	// "countdown" (skip after a 5 second countdown the viewer can cancel) or "instant".
+	// auto_skip_credits covers outro and preview segments and only applies to episodes.
+	// Missing or unknown values fall back to the defaults (intro and recap "countdown",
+	// credits "off").
+	AutoSkipIntro   string `json:"auto_skip_intro,omitempty" required:"false" enum:"off,countdown,instant"`
+	AutoSkipRecap   string `json:"auto_skip_recap,omitempty" required:"false" enum:"off,countdown,instant"`
+	AutoSkipCredits string `json:"auto_skip_credits,omitempty" required:"false" enum:"off,countdown,instant"`
+}
+
+// Auto-skip modes for UserPreferences.AutoSkip*.
+const (
+	AutoSkipOff       = "off"
+	AutoSkipCountdown = "countdown"
+	AutoSkipInstant   = "instant"
+)
+
+// NormalizeAutoSkip returns mode lower-cased when valid, otherwise def.
+func NormalizeAutoSkip(mode, def string) string {
+	switch m := strings.ToLower(strings.TrimSpace(mode)); m {
+	case AutoSkipOff, AutoSkipCountdown, AutoSkipInstant:
+		return m
+	}
+	return def
+}
+
+// normalizeAutoSkip fills missing auto-skip modes with their defaults.
+func (p *UserPreferences) normalizeAutoSkip() {
+	p.AutoSkipIntro = NormalizeAutoSkip(p.AutoSkipIntro, AutoSkipCountdown)
+	p.AutoSkipRecap = NormalizeAutoSkip(p.AutoSkipRecap, AutoSkipCountdown)
+	p.AutoSkipCredits = NormalizeAutoSkip(p.AutoSkipCredits, AutoSkipOff)
 }
 
 // DefaultUserPreferences returns sensible defaults for newly created accounts.
@@ -36,6 +67,9 @@ func DefaultUserPreferences() UserPreferences {
 		AutoplayNext:       true,
 		CombineNextUp:      true,
 		ShowChapterMarkers: true,
+		AutoSkipIntro:      AutoSkipCountdown,
+		AutoSkipRecap:      AutoSkipCountdown,
+		AutoSkipCredits:    AutoSkipOff,
 	}
 }
 
@@ -45,8 +79,12 @@ func ParseUserPreferences(raw string) UserPreferences {
 	if raw != "" && raw != "{}" {
 		_ = json.Unmarshal([]byte(raw), &prefs)
 	}
+	prefs.normalizeAutoSkip()
 	return prefs
 }
+
+// NormalizeAutoSkipModes fills missing auto-skip modes with their defaults.
+func (p *UserPreferences) NormalizeAutoSkipModes() { p.normalizeAutoSkip() }
 
 // Preferences returns the decoded preferences for the user.
 func (u User) Preferences() UserPreferences {
