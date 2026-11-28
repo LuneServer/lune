@@ -32,11 +32,20 @@ const (
 // detection) must yield right now, or "" when the server is idle. Playback counts every
 // client stream (direct play included), not just FFmpeg HLS sessions.
 func (s *Service) busyReason() string {
+	return s.busyReasonFor(context.Background())
+}
+
+// busyReasonFor is busyReason for the run in ctx: a new-media pass (see newMediaScope) does
+// not yield to direct play, only to scans and FFmpeg playback sessions.
+func (s *Service) busyReasonFor(ctx context.Context) string {
 	if s.isScanRunning != nil && s.isScanRunning() {
 		return BusyReasonScan
 	}
 	if s.activeTranscodeDirs != nil && len(s.activeTranscodeDirs()) > 0 {
 		return BusyReasonPlayback
+	}
+	if newMediaScopeFrom(ctx) != nil {
+		return ""
 	}
 	if s.isPlaybackActive != nil && s.isPlaybackActive() {
 		return BusyReasonPlayback
@@ -48,7 +57,7 @@ func (s *Service) isBusyForChapterThumbnails(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return true
 	}
-	reason := s.busyReason()
+	reason := s.busyReasonFor(ctx)
 	if reason == "" {
 		return false
 	}
@@ -172,7 +181,11 @@ func (s *Service) generateChapterThumbnails(ctx context.Context, onProgress func
 	var work []pendingChapterWork
 	totalPendingStills := 0
 
+	scope := newMediaScopeFrom(ctx)
 	for _, item := range items {
+		if !scope.includes(item.ID) {
+			continue
+		}
 		var chapters []metadata.ChapterInfo
 		if err := json.Unmarshal([]byte(item.ChaptersJSON), &chapters); err != nil || len(chapters) == 0 {
 			continue

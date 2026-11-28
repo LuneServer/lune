@@ -239,8 +239,8 @@ type Status struct {
 	// ChaptersResumePending is true while chapter still generation is paused for active
 	// scans/playback and will resume automatically once the server has been idle.
 	ChaptersResumePending bool `json:"chapters_resume_pending,omitempty"`
-	// NewMediaPending is true while a pass for newly added media waits for the server to be
-	// idle (scan finished, no playback, no other pass running).
+	// NewMediaPending is true while a pass for newly added media waits to start (scan
+	// finished, no FFmpeg playback session, no other pass running; direct play is fine).
 	NewMediaPending bool `json:"new_media_pending,omitempty"`
 }
 
@@ -285,15 +285,17 @@ type Service struct {
 	reconfigCh chan struct{}
 
 	// baseCtx outlives individual runs so a paused chapter pass can resume on its own.
-	baseCtx         context.Context
-	resumeArmed     bool
-	resumeCancel    context.CancelFunc
-	resumeGen       uint64
-	resumePoll      time.Duration
-	resumeQuiet     time.Duration
-	resumeMaxWait   time.Duration
-	newMediaArmed   bool
-	newMediaCancel  context.CancelFunc
+	baseCtx        context.Context
+	resumeArmed    bool
+	resumeCancel   context.CancelFunc
+	resumeGen      uint64
+	resumePoll     time.Duration
+	resumeQuiet    time.Duration
+	resumeMaxWait  time.Duration
+	newMediaArmed  bool
+	newMediaCancel context.CancelFunc
+	// newMediaIDs collects the items the queued new-media pass will process.
+	newMediaIDs     map[string]struct{}
 	newMediaGen     uint64
 	newMediaPoll    time.Duration
 	newMediaQuiet   time.Duration
@@ -516,6 +518,7 @@ func (s *Service) CancelRun() bool {
 	newMediaArmed := s.newMediaArmed
 	s.newMediaArmed = false
 	s.newMediaCancel = nil
+	s.newMediaIDs = nil
 	if running && s.progress != nil {
 		p := *s.progress
 		p.Label = "Canceling housekeeping pass…"
@@ -1172,20 +1175,36 @@ func (s *Service) armChapterResume() {
 	}()
 }
 
-// NotifyMediaAdded queues a pass for media a library scan just added or changed, so chapter
-// stills and trickplay are generated now instead of at the next scheduled pass. It does
-// nothing unless automatic housekeeping and at least one of those tasks are enabled.
+// NotifyMediaAdded queues a pass that generates chapter stills and trickplay for itemIDs, the
+// media a library scan just added or changed, so they are ready now instead of at the next
+// scheduled pass. It does nothing unless automatic housekeeping and at least one of those
+// tasks are enabled.
 //
-// The pass starts once the server has been idle for newMediaQuiet: no scan, no playback and
-// no other pass running. A pass that is already running lists its items when its chapter or
+// The pass processes only those items (the backlog stays with scheduled passes) and runs
+// through direct play: it starts once no scan, FFmpeg playback session or other pass has been
+// active for newMediaQuiet, and while it runs it pauses only for scans and FFmpeg sessions
+// (see newMediaScope). A pass that is already running lists its items when its chapter or
 // trickplay step starts, so it can miss media added after that; waiting for it to finish and
-// then running again covers those. Notifications coalesce: at most one pass is queued, and a
-// notification arriving while the queued pass runs queues exactly one follow-up.
-func (s *Service) NotifyMediaAdded() {
+// then running again covers those. Notifications coalesce: at most one pass is queued (later
+// IDs join it), and a notification arriving while the queued pass runs queues one follow-up.
+func (s *Service) NotifyMediaAdded(itemIDs []string) {
+	if len(itemIDs) == 0 {
+		return
+	}
 	s.mu.Lock()
 	cfg := s.cfg
 	if !cfg.Enabled || (!cfg.GenerateChapterThumbnails && !cfg.GenerateTrickplay) ||
-		s.ffmpegBin == "" || s.dataDir == "" || s.store == nil || s.baseCtx == nil || s.newMediaArmed {
+		s.ffmpegBin == "" || s.dataDir == "" || s.store == nil || s.baseCtx == nil {
+		s.mu.Unlock()
+		return
+	}
+	if s.newMediaIDs == nil {
+		s.newMediaIDs = make(map[string]struct{}, len(itemIDs))
+	}
+	for _, id := range itemIDs {
+		s.newMediaIDs[id] = struct{}{}
+	}
+	if s.newMediaArmed {
 		s.mu.Unlock()
 		return
 	}
@@ -1197,17 +1216,23 @@ func (s *Service) NotifyMediaAdded() {
 	poll, quiet, maxWait := s.newMediaPoll, s.newMediaQuiet, s.newMediaMaxWait
 	s.mu.Unlock()
 
+	// idleCtx only selects the new-media busy policy for the wait below.
+	idleCtx := withNewMediaScope(ctx, nil)
 	go func() {
 		defer cancel()
-		disarm := func() bool {
+		// disarm clears the queued pass and hands back its items; ok is false if it was
+		// already dropped (canceled, or superseded by a newer queued pass).
+		disarm := func() (ids map[string]struct{}, ok bool) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
 			if s.newMediaGen != gen || !s.newMediaArmed {
-				return false
+				return nil, false
 			}
+			ids = s.newMediaIDs
 			s.newMediaArmed = false
 			s.newMediaCancel = nil
-			return true
+			s.newMediaIDs = nil
+			return ids, true
 		}
 		deadline := time.Now().Add(maxWait)
 		var idleSince time.Time
@@ -1228,7 +1253,7 @@ func (s *Service) NotifyMediaAdded() {
 			s.mu.Lock()
 			running := s.running
 			s.mu.Unlock()
-			if running || s.busyReason() != "" {
+			if running || s.busyReasonFor(idleCtx) != "" {
 				idleSince = time.Time{}
 				continue
 			}
@@ -1239,13 +1264,15 @@ func (s *Service) NotifyMediaAdded() {
 				continue
 			}
 			// Disarm before running so media added during this pass queues a follow-up.
-			if !disarm() {
+			ids, ok := disarm()
+			if !ok {
 				return // canceled in the meantime
 			}
-			s.logger.Info("generating chapter stills and trickplay for new media")
-			if _, err := s.runOnce(s.baseCtx, TriggerNewMedia, taskNewMedia); err != nil {
+			s.logger.Info("generating chapter stills and trickplay for new media", "items", len(ids))
+			runCtx := withNewMediaScope(s.baseCtx, ids)
+			if _, err := s.runOnce(runCtx, TriggerNewMedia, taskNewMedia); err != nil {
 				if errors.Is(err, ErrAlreadyRunning) {
-					s.NotifyMediaAdded()
+					s.NotifyMediaAdded(mapKeys(ids))
 				} else {
 					s.logger.Warn("new media pass failed", "error", err)
 				}
@@ -1253,4 +1280,12 @@ func (s *Service) NotifyMediaAdded() {
 			return
 		}
 	}()
+}
+
+func mapKeys(m map[string]struct{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

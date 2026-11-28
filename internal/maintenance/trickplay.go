@@ -171,8 +171,12 @@ func (s *Service) generateTrickplay(ctx context.Context, cfg Config, onProgress 
 	}
 	enc := s.trickplaySheetEncoder()
 
+	scope := newMediaScopeFrom(ctx)
 	var work []store.TrickplaySourceItem
 	for _, item := range items {
+		if !scope.includes(item.ID) {
+			continue
+		}
 		res.Total++
 		itemDir := metadata.TrickplayDir(s.dataDir, item.ID)
 		if m, err := metadata.ReadTrickplayManifest(s.dataDir, item.ID); err == nil && trickplayUpToDate(m, item, cfg, enc.Format) {

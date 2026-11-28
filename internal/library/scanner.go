@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -79,7 +78,7 @@ type Service struct {
 	scans       map[string]*ScanStatus
 	warnedNoFFP bool
 	// onMediaChanged runs after a scan that indexed new or modified media files.
-	onMediaChanged func()
+	onMediaChanged func(itemIDs []string)
 }
 
 // NewService creates a library & scanning service.
@@ -131,9 +130,9 @@ func (s *Service) BackfillStaleLibraries(ctx context.Context) error {
 }
 
 // SetMediaChangedHook registers fn to run (on the scan goroutine, after the scan has finished)
-// whenever a scan indexes new files or files whose size or mtime changed. Metadata-only
-// re-indexing does not call it.
-func (s *Service) SetMediaChangedHook(fn func()) {
+// whenever a scan indexes new files or files whose size or mtime changed, passing those items'
+// IDs. Metadata-only re-indexing does not call it.
+func (s *Service) SetMediaChangedHook(fn func(itemIDs []string)) {
 	s.mu.Lock()
 	s.onMediaChanged = fn
 	s.mu.Unlock()
@@ -361,9 +360,12 @@ type discoveredFile struct {
 }
 
 func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) error {
-	// mediaChanged counts saved items whose file is new or changed on disk (not
+	// changedIDs lists saved items whose file is new or changed on disk (not
 	// metadata-only updates), so per-item maintenance can run for them right away.
-	var mediaChanged atomic.Int64
+	var (
+		changedMu  sync.Mutex
+		changedIDs []string
+	)
 	defer func() {
 		s.mu.Lock()
 		if st, ok := s.scans[lib.ID]; ok {
@@ -373,8 +375,11 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 		}
 		hook := s.onMediaChanged
 		s.mu.Unlock()
-		if hook != nil && mediaChanged.Load() > 0 {
-			hook()
+		changedMu.Lock()
+		ids := changedIDs
+		changedMu.Unlock()
+		if hook != nil && len(ids) > 0 {
+			hook(ids)
 		}
 	}()
 
@@ -464,7 +469,7 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 		batch := make([]store.MediaItem, 0, batchSize)
 		addedInBatch := 0
 		updatedInBatch := 0
-		changedInBatch := 0
+		var changedInBatch []string
 		flush := func() {
 			if len(batch) == 0 {
 				return
@@ -478,7 +483,9 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 				s.recordItemErr(lib.ID, first, fmt.Errorf("failed to save batch of %d item(s): %w", len(batch), err), len(batch))
 			} else {
 				s.markRequestsAvailableForItems(ctx, batch)
-				mediaChanged.Add(int64(changedInBatch))
+				changedMu.Lock()
+				changedIDs = append(changedIDs, changedInBatch...)
+				changedMu.Unlock()
 				a, u := addedInBatch, updatedInBatch
 				s.incScan(lib.ID, func(st *ScanStatus) {
 					st.Added += a
@@ -488,7 +495,7 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 			batch = batch[:0]
 			addedInBatch = 0
 			updatedInBatch = 0
-			changedInBatch = 0
+			changedInBatch = changedInBatch[:0]
 		}
 
 		ticker := time.NewTicker(500 * time.Millisecond)
@@ -503,7 +510,7 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 				}
 				batch = append(batch, res.item)
 				if res.fileChanged {
-					changedInBatch++
+					changedInBatch = append(changedInBatch, res.item.ID)
 				}
 				if res.isNew {
 					addedInBatch++
