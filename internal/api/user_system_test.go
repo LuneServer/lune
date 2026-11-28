@@ -704,3 +704,59 @@ func TestUserSystemInvitesAndAdminManagement(t *testing.T) {
 		t.Fatalf("expected 2 dismissed alert ids, got %+v", disResp.DismissedIDs)
 	}
 }
+
+func TestUserPreferencesSubtitleStyleSyncAndPreserve(t *testing.T) {
+	h, adminCookie, _, _, _, _ := setupUserSystemFixture(t)
+
+	patch := func(prefs map[string]any) *httptest.ResponseRecorder {
+		t.Helper()
+		prefs["subtitles_enabled"] = false
+		if _, ok := prefs["autoplay_next"]; !ok {
+			prefs["autoplay_next"] = true
+		}
+		return doJSON(t, h, http.MethodPatch, "/api/v1/users/me", map[string]any{"preferences": prefs}, adminCookie, "")
+	}
+	readStyle := func() *store.SubtitleStyle {
+		t.Helper()
+		rec := doJSON(t, h, http.MethodGet, "/api/v1/users/me", nil, adminCookie, "")
+		var prof UserProfileDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &prof); err != nil {
+			t.Fatal(err)
+		}
+		return prof.Preferences.SubtitleStyle
+	}
+
+	if st := readStyle(); st != nil {
+		t.Fatalf("expected no stored subtitle style by default, got %+v", st)
+	}
+
+	rec := patch(map[string]any{
+		"autoplay_next": true,
+		"subtitle_style": map[string]any{
+			"size": "large", "color": "yellow", "background": false, "outline": true,
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	want := store.SubtitleStyle{Size: "large", Color: "yellow", Background: false, Outline: true}
+	if st := readStyle(); st == nil || *st != want {
+		t.Fatalf("subtitle style = %+v, want %+v", st, want)
+	}
+
+	// A client that doesn't know subtitle_style must not erase it.
+	if rec := patch(map[string]any{"autoplay_next": false}); rec.Code != http.StatusOK {
+		t.Fatalf("PATCH (legacy client) status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if st := readStyle(); st == nil || *st != want {
+		t.Fatalf("subtitle style after legacy update = %+v, want %+v", st, want)
+	}
+
+	// Unknown values are rejected.
+	rec = patch(map[string]any{
+		"subtitle_style": map[string]any{"size": "huge", "color": "white", "background": true, "outline": false},
+	})
+	if rec.Code < 400 || rec.Code >= 500 {
+		t.Fatalf("expected 4xx for invalid size, got %d", rec.Code)
+	}
+}

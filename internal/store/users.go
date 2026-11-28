@@ -36,6 +36,29 @@ type UserPreferences struct {
 	AutoSkipIntro   string `json:"auto_skip_intro,omitempty" required:"false" enum:"off,countdown,instant"`
 	AutoSkipRecap   string `json:"auto_skip_recap,omitempty" required:"false" enum:"off,countdown,instant"`
 	AutoSkipCredits string `json:"auto_skip_credits,omitempty" required:"false" enum:"off,countdown,instant"`
+	// SubtitleStyle syncs subtitle appearance across clients. Nil means client defaults
+	// (medium, white, background on, outline off), and an update that omits it keeps the
+	// stored value so older clients don't erase it.
+	SubtitleStyle *SubtitleStyle `json:"subtitle_style,omitempty" required:"false"`
+}
+
+// SubtitleStyle is the user's cross-platform subtitle appearance.
+type SubtitleStyle struct {
+	Size       string `json:"size" enum:"small,medium,large"`
+	Color      string `json:"color" enum:"white,yellow,cyan,green,magenta"`
+	Background bool   `json:"background"`
+	Outline    bool   `json:"outline"`
+}
+
+// Subtitle style values accepted by the API.
+var (
+	SubtitleSizes  = []string{"small", "medium", "large"}
+	SubtitleColors = []string{"white", "yellow", "cyan", "green", "magenta"}
+)
+
+// DefaultSubtitleStyle matches the look clients render when no style is stored.
+func DefaultSubtitleStyle() SubtitleStyle {
+	return SubtitleStyle{Size: "medium", Color: "white", Background: true}
 }
 
 // Auto-skip modes for UserPreferences.AutoSkip*.

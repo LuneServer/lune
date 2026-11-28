@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -429,6 +430,26 @@ func (s *Service) UpdateSelfProfile(ctx context.Context, actor store.User, displ
 			p.PosterBadges = cleaned
 		} else {
 			p.PosterBadges = nil
+		}
+		if p.SubtitleStyle == nil {
+			p.SubtitleStyle = curPrefs.SubtitleStyle
+		} else {
+			st := *p.SubtitleStyle
+			st.Size = strings.ToLower(strings.TrimSpace(st.Size))
+			st.Color = strings.ToLower(strings.TrimSpace(st.Color))
+			if st.Size == "" {
+				st.Size = "medium"
+			}
+			if st.Color == "" {
+				st.Color = "white"
+			}
+			if !slices.Contains(store.SubtitleSizes, st.Size) {
+				return UserDetail{}, fmt.Errorf("%w: unknown subtitle size %q", ErrValidation, st.Size)
+			}
+			if !slices.Contains(store.SubtitleColors, st.Color) {
+				return UserDetail{}, fmt.Errorf("%w: unknown subtitle color %q", ErrValidation, st.Color)
+			}
+			p.SubtitleStyle = &st
 		}
 		curPrefs = p
 	}
