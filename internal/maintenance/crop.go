@@ -135,6 +135,7 @@ func (s *Service) cropdetectAt(ctx context.Context, filePath, at string) (cropRe
 		"-nostdin", "-hide_banner", "-nostats",
 		"-loglevel", "info",
 		"-threads", "1",
+		"-filter_threads", "1",
 		"-skip_frame", "nokey",
 		"-ss", at,
 		"-i", filePath,
@@ -147,7 +148,7 @@ func (s *Service) cropdetectAt(ctx context.Context, filePath, at string) (cropRe
 	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	runErr := runBackground(cmd)
 
 	var (
 		last           *cropRect
