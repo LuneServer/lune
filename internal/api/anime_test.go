@@ -232,10 +232,10 @@ func TestAnimeLibraryFirstClassFlow(t *testing.T) {
 		t.Fatalf("unexpected ASS->VTT response: status=%d body=%q", rec.Code, rec.Body.String())
 	}
 
-	// 7. Switching user preference to English Dub should auto-select English audio + Forced Signs & Songs subtitle!
+	// 7. Switching the anime preference to Dubbed should auto-select English audio + Forced Signs & Songs subtitle!
 	rec = doJSON(t, h, http.MethodPatch, "/api/v1/users/me", map[string]any{
 		"preferences": map[string]any{
-			"audio_language":    "en",
+			"anime_audio":       "dubbed",
 			"subtitle_language": "en",
 			"subtitles_enabled": false,
 			"autoplay_next":     true,

@@ -436,7 +436,7 @@ func (s *Service) UpdateSelfProfile(ctx context.Context, actor store.User, displ
 		} else if mode, ok := store.NormalizeAnimeAudio(p.AnimeAudio); ok {
 			p.AnimeAudio = mode
 		} else {
-			return UserDetail{}, fmt.Errorf("%w: anime_audio must be auto, subbed or dubbed", ErrValidation)
+			return UserDetail{}, fmt.Errorf("%w: anime_audio must be subbed or dubbed", ErrValidation)
 		}
 		if p.SubtitleStyle == nil {
 			p.SubtitleStyle = curPrefs.SubtitleStyle

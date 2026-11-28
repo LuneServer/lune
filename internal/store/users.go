@@ -40,28 +40,24 @@ type UserPreferences struct {
 	// (medium, white, background on, outline off), and an update that omits it keeps the
 	// stored value so older clients don't erase it.
 	SubtitleStyle *SubtitleStyle `json:"subtitle_style,omitempty" required:"false"`
-	// AnimeAudio chooses the tracks for items in anime libraries only: "subbed" (Japanese
-	// audio with full subtitles in subtitle_language) or "dubbed" (audio in the user's main
-	// language with only Signs & Songs subtitles). For anime it replaces audio_language and
-	// subtitles_enabled, which stay the defaults for all other media. Empty (sent as "auto")
-	// keeps the older automatic behaviour. Like subtitle_style, an update that omits it keeps
-	// the stored value so older clients don't erase it.
-	AnimeAudio string `json:"anime_audio,omitempty" required:"false" enum:"auto,subbed,dubbed"`
+	// AnimeAudio chooses the tracks for items in anime libraries only: "subbed" (default;
+	// Japanese audio with full subtitles in subtitle_language) or "dubbed" (audio in the user's
+	// main language with only Signs & Songs subtitles). For anime it replaces audio_language and
+	// subtitles_enabled, which stay the defaults for all other media. Always returned; an update
+	// that omits it keeps the stored value.
+	AnimeAudio string `json:"anime_audio" required:"false" enum:"subbed,dubbed"`
 }
 
 // Anime audio modes for UserPreferences.AnimeAudio.
 const (
-	AnimeAudioAuto   = "auto"
 	AnimeAudioSubbed = "subbed"
 	AnimeAudioDubbed = "dubbed"
 )
 
-// NormalizeAnimeAudio returns "subbed" or "dubbed", "" for auto/empty, and ok=false
-// for anything else.
+// NormalizeAnimeAudio returns mode lower-cased when it is "subbed" or "dubbed", and
+// ok=false for anything else.
 func NormalizeAnimeAudio(mode string) (string, bool) {
 	switch m := strings.ToLower(strings.TrimSpace(mode)); m {
-	case "", AnimeAudioAuto:
-		return "", true
 	case AnimeAudioSubbed, AnimeAudioDubbed:
 		return m, true
 	}
@@ -119,6 +115,7 @@ func DefaultUserPreferences() UserPreferences {
 		AutoSkipIntro:      AutoSkipCountdown,
 		AutoSkipRecap:      AutoSkipCountdown,
 		AutoSkipCredits:    AutoSkipOff,
+		AnimeAudio:         AnimeAudioSubbed,
 	}
 }
 
@@ -129,7 +126,11 @@ func ParseUserPreferences(raw string) UserPreferences {
 		_ = json.Unmarshal([]byte(raw), &prefs)
 	}
 	prefs.normalizeAutoSkip()
-	prefs.AnimeAudio, _ = NormalizeAnimeAudio(prefs.AnimeAudio)
+	if mode, ok := NormalizeAnimeAudio(prefs.AnimeAudio); ok {
+		prefs.AnimeAudio = mode
+	} else {
+		prefs.AnimeAudio = AnimeAudioSubbed
+	}
 	return prefs
 }
 

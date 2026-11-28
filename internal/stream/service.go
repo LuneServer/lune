@@ -382,10 +382,13 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		_ = json.Unmarshal([]byte(item.SubtitlesJSON), &sidecarTracks)
 	}
 
-	// Temporarily collect candidate subtitles (without URLs yet) so audio selection can see
-	// whether subtitles are available (e.g. preferring original Japanese audio for anime when subs exist).
-	subMeta := buildSubtitleCatalog(sidecarTracks, streams, s.transcoder.Available(), "")
-	selectedAudioIdx, selectedAudioLang := selectPreferredAudio(audioTracks, caps.AudioStreamIndex, prefs, isAnime, len(subMeta) > 0)
+	// Subbed anime only picks Japanese audio when there are subtitles to read, so it needs the
+	// candidate subtitles (without URLs yet) before the audio decision.
+	var subMeta []SubtitleStreamDTO
+	if isAnime {
+		subMeta = buildSubtitleCatalog(sidecarTracks, streams, s.transcoder.Available(), "")
+	}
+	selectedAudioIdx, selectedAudioLang := selectPreferredAudio(audioTracks, caps.AudioStreamIndex, prefs, isAnime, subMeta)
 
 	var selectedAudioTrack *AudioTrackDTO
 	if selectedAudioIdx != nil {
@@ -679,7 +682,7 @@ func (s *Service) InspectItemTracks(ctx context.Context, user store.User, item s
 	ffmpegAvail := s.transcoder != nil && s.transcoder.Available()
 	subDTOs := buildSubtitleCatalog(sidecarTracks, streams, ffmpegAvail, "")
 	prefs := user.Preferences()
-	selectedAudioIdx, selectedAudioLang := selectPreferredAudio(audioTracks, nil, prefs, isAnime, len(subDTOs) > 0)
+	selectedAudioIdx, selectedAudioLang := selectPreferredAudio(audioTracks, nil, prefs, isAnime, subDTOs)
 	selectedSubIdx := selectPreferredSubtitle(subDTOs, selectedAudioLang, prefs, isAnime)
 
 	return ItemTrackSelection{
@@ -1558,7 +1561,7 @@ func buildSubtitleCatalog(sidecars []library.SubtitleTrack, streams []metadata.S
 	return out
 }
 
-func selectPreferredAudio(tracks []AudioTrackDTO, explicitIdx *int, prefs store.UserPreferences, isAnime, hasSubs bool) (*int, string) {
+func selectPreferredAudio(tracks []AudioTrackDTO, explicitIdx *int, prefs store.UserPreferences, isAnime bool, subs []SubtitleStreamDTO) (*int, string) {
 	if len(tracks) == 0 {
 		return explicitIdx, ""
 	}
@@ -1574,15 +1577,15 @@ func selectPreferredAudio(tracks []AudioTrackDTO, explicitIdx *int, prefs store.
 	desiredLang := metadata.NormalizeLanguage(prefs.AudioLanguage)
 	switch animeAudioMode(prefs, isAnime) {
 	case store.AnimeAudioSubbed:
-		desiredLang = "ja"
+		// Japanese is only watchable with subtitles the viewer can read; without them, fall back
+		// to the viewer's language (then the file's default track) like Dubbed.
+		if hasReadableSubtitles(subs, prefs) {
+			desiredLang = "ja"
+		} else {
+			desiredLang = mainLanguage(prefs)
+		}
 	case store.AnimeAudioDubbed:
 		desiredLang = mainLanguage(prefs)
-	default:
-		// For anime libraries, when the user hasn't configured an explicit audio preference and
-		// subtitles are present, default to original Japanese audio when available.
-		if desiredLang == "" && isAnime && hasSubs {
-			desiredLang = "ja"
-		}
 	}
 
 	if desiredLang != "" {
@@ -1604,18 +1607,37 @@ func selectPreferredAudio(tracks []AudioTrackDTO, explicitIdx *int, prefs store.
 	return &idx, metadata.NormalizeLanguage(tracks[0].Language)
 }
 
-// animeAudioMode returns the user's anime_audio mode for anime items, "" otherwise.
+// hasReadableSubtitles reports whether subs has a full (non-forced) text track that would be
+// auto-selected for the viewer: one in their subtitle language or with no language tag.
+// Burn-in tracks don't count because they are never auto-selected.
+func hasReadableSubtitles(subs []SubtitleStreamDTO, prefs store.UserPreferences) bool {
+	lang := metadata.NormalizeLanguage(prefs.SubtitleLanguage)
+	if lang == "" {
+		lang = "en"
+	}
+	for _, s := range subs {
+		if !s.RequiresBurnIn && !s.Forced && (s.Language == lang || s.Language == "") {
+			return true
+		}
+	}
+	return false
+}
+
+// animeAudioMode returns the user's anime_audio mode ("subbed" unless "dubbed") for anime
+// items, "" otherwise.
 func animeAudioMode(prefs store.UserPreferences, isAnime bool) string {
 	if !isAnime {
 		return ""
 	}
-	mode, _ := store.NormalizeAnimeAudio(prefs.AnimeAudio)
-	return mode
+	if mode, ok := store.NormalizeAnimeAudio(prefs.AnimeAudio); ok {
+		return mode
+	}
+	return store.AnimeAudioSubbed
 }
 
 // mainLanguage is the language a dubbed viewer wants to hear: their audio language unless it
-// is Japanese (older clients stored "ja" for the subbed preset), else their subtitle language,
-// else English.
+// is Japanese (a Japanese "dub" is just the original), else their subtitle language, else
+// English.
 func mainLanguage(prefs store.UserPreferences) string {
 	if l := metadata.NormalizeLanguage(prefs.AudioLanguage); l != "" && l != "ja" {
 		return l
@@ -1640,7 +1662,7 @@ func selectPreferredSubtitle(subs []SubtitleStreamDTO, audioLang string, prefs s
 	// 2. The audio is in a known language other than the subtitle language (a Korean film, anime
 	//    in Japanese), so the viewer needs full subtitles to follow it.
 	//
-	// For anime with an explicit anime_audio mode, subtitles_enabled is ignored: subbed shows full
+	// For anime, anime_audio decides and subtitles_enabled is ignored: subbed shows full
 	// subtitles unless the audio is already in the subtitle language, dubbed shows them only when
 	// no dub was found and the audio fell back to another language.
 	var wantFull bool
