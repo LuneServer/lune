@@ -62,7 +62,7 @@ func TestAnimeAudioSelection(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			aIdx, aLang := selectPreferredAudio(tc.tracks, nil, tc.prefs, tc.anime)
+			aIdx, aLang := selectPreferredAudio(tc.tracks, nil, tc.prefs, tc.anime, subs)
 			if aIdx == nil || *aIdx != tc.wantAudio {
 				t.Fatalf("audio = %v, want %d", aIdx, tc.wantAudio)
 			}
@@ -73,6 +73,37 @@ func TestAnimeAudioSelection(t *testing.T) {
 			}
 			if got != tc.wantSub {
 				t.Fatalf("subtitle = %d, want %d", got, tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestSubbedFallsBackWithoutReadableSubtitles(t *testing.T) {
+	dual := []AudioTrackDTO{
+		{Index: 0, Language: "ja", Default: true},
+		{Index: 1, Language: "en"},
+	}
+	subbed := store.UserPreferences{SubtitleLanguage: "en", AnimeAudio: "subbed"}
+
+	cases := []struct {
+		name      string
+		tracks    []AudioTrackDTO
+		subs      []SubtitleStreamDTO
+		wantAudio int
+	}{
+		{"English subtitles: Japanese", dual, []SubtitleStreamDTO{{Index: 0, Language: "en"}}, 0},
+		{"untagged subtitles: Japanese", dual, []SubtitleStreamDTO{{Index: 0, Language: ""}}, 0},
+		{"no subtitles: English dub", dual, nil, 1},
+		{"only Signs & Songs: English dub", dual, []SubtitleStreamDTO{{Index: 0, Language: "en", Forced: true}}, 1},
+		{"only burn-in subtitles: English dub", dual, []SubtitleStreamDTO{{Index: 0, Language: "en", RequiresBurnIn: true}}, 1},
+		{"only other-language subtitles: English dub", dual, []SubtitleStreamDTO{{Index: 0, Language: "de"}}, 1},
+		{"no subtitles and no dub: default track", []AudioTrackDTO{{Index: 0, Language: "ja", Default: true}}, nil, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			idx, _ := selectPreferredAudio(tc.tracks, nil, subbed, true, tc.subs)
+			if idx == nil || *idx != tc.wantAudio {
+				t.Fatalf("audio = %v, want %d", idx, tc.wantAudio)
 			}
 		})
 	}
