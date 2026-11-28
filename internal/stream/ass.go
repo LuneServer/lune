@@ -1268,6 +1268,7 @@ func (g *assGrouper) layoutPositioned(grp []*assEvent) (text, settings string, m
 	}
 	minX, maxX := math.Inf(1), math.Inf(-1)
 	minY, maxY := math.Inf(1), math.Inf(-1)
+	var aligns []int
 	var lines []string
 	for _, row := range rows {
 		sort.SliceStable(row, func(i, j int) bool { return row[i].cx < row[j].cx })
@@ -1279,6 +1280,7 @@ func (g *assGrouper) layoutPositioned(grp []*assEvent) (text, settings string, m
 		lines = append(lines, line)
 		for _, pc := range row {
 			w := pc.units * pc.fs
+			aligns = append(aligns, pc.ev.alignment)
 			minX = math.Min(minX, pc.left)
 			maxX = math.Max(maxX, pc.left+w)
 			minY = math.Min(minY, pc.cy-pc.fs/2)
@@ -1289,7 +1291,32 @@ func (g *assGrouper) layoutPositioned(grp []*assEvent) (text, settings string, m
 		return "", "", false
 	}
 	resX, resY := g.p.resolution()
-	return strings.Join(lines, "\n"), positionedSettings((minX+maxX)/2/resX, (minY+maxY)/2/resY), marked
+	h, v := sharedAnchor(aligns)
+	return strings.Join(lines, "\n"), positionedSettings(minX/resX, maxX/resX, minY/resY, maxY/resY, h, v), marked
+}
+
+// sharedAnchor returns the side the events of a sign agree on, horizontally (0 left, 1 centre,
+// 2 right) and vertically (0 top, 1 middle, 2 bottom). Mixed anchors fall back to the centre.
+func sharedAnchor(aligns []int) (h, v int) {
+	h, v = -1, -1
+	for _, a := range aligns {
+		ax, ay := anchorFractions(a)
+		ah, av := int(ax*2), int(ay*2)
+		if h == -1 {
+			h, v = ah, av
+			continue
+		}
+		if h != ah {
+			h = 1
+		}
+		if v != av {
+			v = 1
+		}
+	}
+	if h == -1 {
+		return 1, 1
+	}
+	return h, v
 }
 
 // joinRow concatenates the pieces of one row left to right. When the row carries whitespace
@@ -1379,11 +1406,23 @@ func clampPct(v, lo, hi float64) float64 {
 	return math.Min(math.Max(v, lo), hi)
 }
 
-// positionedSettings centres the cue on the group's box, clamped so it stays on screen.
-func positionedSettings(fx, fy float64) string {
-	x := clampPct(fx*100, 10, 90)
-	y := clampPct(fy*100, 8, 92)
-	return fmt.Sprintf("line:%s%%,center position:%s%%,center align:center", fmtPct(y), fmtPct(x))
+// positionedSettings places the cue on the group's box (fractions of the frame) by the side its
+// events anchor (h/v from sharedAnchor): a right-aligned episode title is right-aligned on its
+// right edge, a top-anchored sign hangs from its top edge. The box centre is clamped on screen as
+// before and the anchored edge moves with it.
+func positionedSettings(left, right, top, bottom float64, h, v int) string {
+	cx, cy := (left+right)/2*100, (top+bottom)/2*100
+	dx := clampPct(cx, 10, 90) - cx
+	dy := clampPct(cy, 8, 92) - cy
+	if math.IsNaN(cx) || math.IsNaN(cy) {
+		return "line:50%,center position:50%,center align:center"
+	}
+	x := clampPct([...]float64{left, (left + right) / 2, right}[h]*100+dx, 0, 100)
+	y := clampPct([...]float64{top, (top + bottom) / 2, bottom}[v]*100+dy, 0, 100)
+	lineAlign := [...]string{"start", "center", "end"}[v]
+	posAlign := [...]string{"line-left", "center", "line-right"}[h]
+	textAlign := [...]string{"left", "center", "right"}[h]
+	return fmt.Sprintf("line:%s%%,%s position:%s%%,%s align:%s", fmtPct(y), lineAlign, fmtPct(x), posAlign, textAlign)
 }
 
 func unpositionedSettings(alignment int) string {
