@@ -36,7 +36,25 @@ const (
 	TaskChapterThumbnails = "chapter_thumbnails"
 	TaskTrickplay         = "trickplay"
 	TaskOptimizeDB        = "optimize_db"
+
+	// taskNewMedia is internal (not accepted by RunTask): it runs the enabled per-item
+	// generators (chapter stills, trickplay) after a scan adds or changes media files.
+	taskNewMedia = "new_media"
 )
+
+// Run triggers recorded in RunReport.Trigger.
+const (
+	TriggerScheduled = "scheduled"
+	TriggerManual    = "manual"
+	TriggerResume    = "resume"
+	TriggerNewMedia  = "new_media"
+)
+
+// isBackgroundTrigger reports runs started by the server itself outside the schedule.
+// They must not move a rolling schedule, or frequent additions would postpone it forever.
+func isBackgroundTrigger(trigger string) bool {
+	return trigger == TriggerResume || trigger == TriggerNewMedia
+}
 
 func isValidTask(task string) bool {
 	switch task {
@@ -62,7 +80,7 @@ type Config struct {
 	GenerateChapterThumbnails bool   `json:"generate_chapter_thumbnails"` // default true
 	// Trickplay scrubbing previews (keyframe-only sprite sheets). Optional in requests so older
 	// clients keep working; zero interval/width fall back to defaults.
-	GenerateTrickplay        bool `json:"generate_trickplay" required:"false"`         // default false
+	GenerateTrickplay        bool `json:"generate_trickplay" required:"false"`         // default true (omitted = false)
 	TrickplayIntervalSeconds int  `json:"trickplay_interval_seconds" required:"false"` // 2..60 (default 10)
 	TrickplayWidth           int  `json:"trickplay_width" required:"false"`            // 160..480 (default 320)
 }
@@ -97,6 +115,7 @@ func DefaultConfig() Config {
 		AuditRetentionDays:        90,
 		OptimizeDatabase:          true,
 		GenerateChapterThumbnails: true,
+		GenerateTrickplay:         true,
 		TrickplayIntervalSeconds:  DefaultTrickplayIntervalSeconds,
 		TrickplayWidth:            DefaultTrickplayWidth,
 	}
@@ -165,7 +184,7 @@ type RunReport struct {
 	StartedAt                     time.Time `json:"started_at"`
 	FinishedAt                    time.Time `json:"finished_at"`
 	DurationMS                    int64     `json:"duration_ms"`
-	Trigger                       string    `json:"trigger"` // "scheduled" | "manual" | "resume"
+	Trigger                       string    `json:"trigger"` // "scheduled" | "manual" | "resume" | "new_media"
 	Task                          string    `json:"task,omitempty"`
 	Canceled                      bool      `json:"canceled,omitempty"`
 	SkippedArtworkScanBusy        bool      `json:"skipped_artwork_scan_busy,omitempty"`
@@ -220,6 +239,9 @@ type Status struct {
 	// ChaptersResumePending is true while chapter still generation is paused for active
 	// scans/playback and will resume automatically once the server has been idle.
 	ChaptersResumePending bool `json:"chapters_resume_pending,omitempty"`
+	// NewMediaPending is true while a pass for newly added media waits for the server to be
+	// idle (scan finished, no playback, no other pass running).
+	NewMediaPending bool `json:"new_media_pending,omitempty"`
 }
 
 const (
@@ -230,6 +252,14 @@ const (
 	chapterResumeQuiet = 90 * time.Second
 	// chapterResumeMaxWait abandons the automatic resume; the next scheduled pass picks up.
 	chapterResumeMaxWait = 24 * time.Hour
+
+	// newMediaPoll is how often a queued new-media pass checks whether the server is idle.
+	newMediaPoll = 5 * time.Second
+	// newMediaQuiet is how long the server must stay idle before the new-media pass starts,
+	// so back-to-back library scans (or watcher bursts) coalesce into one pass.
+	newMediaQuiet = 30 * time.Second
+	// newMediaMaxWait abandons a queued new-media pass; the next scheduled pass picks up.
+	newMediaMaxWait = 24 * time.Hour
 )
 
 // Options injects runtime hooks used to guard housekeeping against active scans or streams.
@@ -255,15 +285,21 @@ type Service struct {
 	reconfigCh chan struct{}
 
 	// baseCtx outlives individual runs so a paused chapter pass can resume on its own.
-	baseCtx       context.Context
-	resumeArmed   bool
-	resumeCancel  context.CancelFunc
-	resumeGen     uint64
-	resumePoll    time.Duration
-	resumeQuiet   time.Duration
-	resumeMaxWait time.Duration
-	tpEncOnce     sync.Once
-	tpEnc         trickplayEncoder
+	baseCtx         context.Context
+	resumeArmed     bool
+	resumeCancel    context.CancelFunc
+	resumeGen       uint64
+	resumePoll      time.Duration
+	resumeQuiet     time.Duration
+	resumeMaxWait   time.Duration
+	newMediaArmed   bool
+	newMediaCancel  context.CancelFunc
+	newMediaGen     uint64
+	newMediaPoll    time.Duration
+	newMediaQuiet   time.Duration
+	newMediaMaxWait time.Duration
+	tpEncOnce       sync.Once
+	tpEnc           trickplayEncoder
 
 	updateMu        sync.Mutex
 	mu              sync.Mutex
@@ -299,6 +335,9 @@ func NewService(ctx context.Context, s *store.Store, opts Options) *Service {
 		resumePoll:          chapterResumePoll,
 		resumeQuiet:         chapterResumeQuiet,
 		resumeMaxWait:       chapterResumeMaxWait,
+		newMediaPoll:        newMediaPoll,
+		newMediaQuiet:       newMediaQuiet,
+		newMediaMaxWait:     newMediaMaxWait,
 	}
 	svc.loadPersisted(ctx)
 	return svc
@@ -326,7 +365,7 @@ func (s *Service) loadPersisted(ctx context.Context) {
 			s.lastScheduledAt = ts.UTC()
 		}
 	}
-	if s.lastRun != nil && s.lastRun.Trigger == "scheduled" && !s.lastRun.FinishedAt.IsZero() {
+	if s.lastRun != nil && s.lastRun.Trigger == TriggerScheduled && !s.lastRun.FinishedAt.IsZero() {
 		if s.lastScheduledAt.IsZero() || s.lastRun.FinishedAt.After(s.lastScheduledAt) {
 			s.lastScheduledAt = s.lastRun.FinishedAt.UTC()
 		}
@@ -343,6 +382,7 @@ func (s *Service) Status() Status {
 		Running:               s.running,
 		ServerTimezone:        tzName,
 		ChaptersResumePending: s.resumeArmed,
+		NewMediaPending:       s.newMediaArmed,
 	}
 	if s.progress != nil {
 		p := *s.progress
@@ -434,7 +474,7 @@ func (s *Service) Run(ctx context.Context) {
 			timer.Stop()
 			continue
 		case <-timer.C:
-			_, err := s.runOnce(ctx, "scheduled", "")
+			_, err := s.runOnce(ctx, TriggerScheduled, "")
 			if err != nil && !errors.Is(err, ErrAlreadyRunning) && ctx.Err() == nil {
 				s.logger.Warn("scheduled maintenance run failed", "error", err)
 			}
@@ -455,14 +495,15 @@ func (s *Service) RunTask(ctx context.Context, task string) (Status, error) {
 	if !isValidTask(task) {
 		return Status{}, fmt.Errorf("%w: unknown task %q", ErrInvalidTask, task)
 	}
-	if _, err := s.runOnce(context.WithoutCancel(ctx), "manual", task); err != nil {
+	if _, err := s.runOnce(context.WithoutCancel(ctx), TriggerManual, task); err != nil {
 		return Status{}, err
 	}
 	return s.Status(), nil
 }
 
 // CancelRun requests cancellation of any currently running maintenance pass and drops any
-// pending automatic chapter-still resume. Returns true if a pass or pending resume was stopped.
+// pending automatic chapter-still resume or new-media pass. Returns true if a pass or pending
+// automatic pass was stopped.
 func (s *Service) CancelRun() bool {
 	s.mu.Lock()
 	cancel := s.cancelRun
@@ -471,6 +512,10 @@ func (s *Service) CancelRun() bool {
 	resumeArmed := s.resumeArmed
 	s.resumeArmed = false
 	s.resumeCancel = nil
+	newMediaCancel := s.newMediaCancel
+	newMediaArmed := s.newMediaArmed
+	s.newMediaArmed = false
+	s.newMediaCancel = nil
 	if running && s.progress != nil {
 		p := *s.progress
 		p.Label = "Canceling housekeeping pass…"
@@ -480,11 +525,14 @@ func (s *Service) CancelRun() bool {
 	if resumeCancel != nil {
 		resumeCancel()
 	}
+	if newMediaCancel != nil {
+		newMediaCancel()
+	}
 	if running && cancel != nil {
 		cancel()
 		return true
 	}
-	return resumeArmed
+	return resumeArmed || newMediaArmed
 }
 
 func (s *Service) computeNextRunLocked(now time.Time) time.Time {
@@ -498,7 +546,7 @@ func computeNextRun(now time.Time, cfg Config, lastRun *RunReport, lastScheduled
 	interval := time.Duration(cfg.IntervalHours) * time.Hour
 
 	scheduledAnchor := lastScheduledAt
-	if scheduledAnchor.IsZero() && lastRun != nil && lastRun.Trigger == "scheduled" && !lastRun.FinishedAt.IsZero() {
+	if scheduledAnchor.IsZero() && lastRun != nil && lastRun.Trigger == TriggerScheduled && !lastRun.FinishedAt.IsZero() {
 		scheduledAnchor = lastRun.FinishedAt
 	}
 
@@ -547,8 +595,12 @@ func computeNextRun(now time.Time, cfg Config, lastRun *RunReport, lastScheduled
 		return candidate.UTC()
 	}
 
-	if lastRun != nil && !lastRun.FinishedAt.IsZero() {
-		next := lastRun.FinishedAt.Add(interval)
+	rollingAnchor := scheduledAnchor
+	if lastRun != nil && !lastRun.FinishedAt.IsZero() && !isBackgroundTrigger(lastRun.Trigger) {
+		rollingAnchor = lastRun.FinishedAt
+	}
+	if !rollingAnchor.IsZero() {
+		next := rollingAnchor.Add(interval)
 		if next.After(now) {
 			return next
 		}
@@ -594,11 +646,12 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		}
 	}()
 
+	perItem := task == "" || task == taskNewMedia
 	wantArtwork := task == "" && cfg.CleanupOrphanedArtwork || task == TaskArtwork
 	wantTranscode := task == "" && cfg.CleanupTranscodeCache || task == TaskTranscodeCache
 	wantAudit := task == "" && cfg.PruneAuditLogs || task == TaskAudit
-	wantChapters := task == "" && cfg.GenerateChapterThumbnails || task == TaskChapterThumbnails
-	wantTrickplay := task == "" && cfg.GenerateTrickplay || task == TaskTrickplay
+	wantChapters := perItem && cfg.GenerateChapterThumbnails || task == TaskChapterThumbnails
+	wantTrickplay := perItem && cfg.GenerateTrickplay || task == TaskTrickplay
 	wantOptimize := task == "" && cfg.OptimizeDatabase || task == TaskOptimizeDB
 
 	runArtwork := wantArtwork && s.dataDir != "" && s.store != nil
@@ -703,6 +756,10 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 		StartedAt: started,
 		Trigger:   trigger,
 		Task:      task,
+	}
+	if task == taskNewMedia {
+		// Reported like a (partial) housekeeping pass: the trigger says why it ran.
+		report.Task = ""
 	}
 
 	// 1. Orphaned artwork cleanup (guarded against active scans & grace window).
@@ -852,7 +909,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 	s.mu.Lock()
 	cp := report
 	s.lastRun = &cp
-	if trigger == "scheduled" {
+	if trigger == TriggerScheduled {
 		s.lastScheduledAt = report.FinishedAt
 	}
 	s.mu.Unlock()
@@ -869,7 +926,7 @@ func (s *Service) runOnce(ctx context.Context, trigger, task string) (RunReport,
 				s.logger.Warn("failed to persist maintenance run report", "error", err)
 			}
 		}
-		if trigger == "scheduled" {
+		if trigger == TriggerScheduled {
 			if err := s.store.SetSetting(persistCtx, LastScheduledSettingKey, report.FinishedAt.UTC().Format(time.RFC3339Nano)); err != nil {
 				s.logger.Warn("failed to persist last scheduled maintenance timestamp", "error", err)
 			}
@@ -1103,11 +1160,94 @@ func (s *Service) armChapterResume() {
 			// Disarm before running so a run that pauses again can re-arm a fresh watcher.
 			disarm()
 			s.logger.Info("resuming paused chapter still generation")
-			if _, err := s.runOnce(s.baseCtx, "resume", TaskChapterThumbnails); err != nil {
+			if _, err := s.runOnce(s.baseCtx, TriggerResume, TaskChapterThumbnails); err != nil {
 				if errors.Is(err, ErrAlreadyRunning) {
 					s.armChapterResume()
 				} else if ctx.Err() == nil {
 					s.logger.Warn("resumed chapter still generation failed", "error", err)
+				}
+			}
+			return
+		}
+	}()
+}
+
+// NotifyMediaAdded queues a pass for media a library scan just added or changed, so chapter
+// stills and trickplay are generated now instead of at the next scheduled pass. It does
+// nothing unless automatic housekeeping and at least one of those tasks are enabled.
+//
+// The pass starts once the server has been idle for newMediaQuiet: no scan, no playback and
+// no other pass running. A pass that is already running lists its items when its chapter or
+// trickplay step starts, so it can miss media added after that; waiting for it to finish and
+// then running again covers those. Notifications coalesce: at most one pass is queued, and a
+// notification arriving while the queued pass runs queues exactly one follow-up.
+func (s *Service) NotifyMediaAdded() {
+	s.mu.Lock()
+	cfg := s.cfg
+	if !cfg.Enabled || (!cfg.GenerateChapterThumbnails && !cfg.GenerateTrickplay) ||
+		s.ffmpegBin == "" || s.dataDir == "" || s.store == nil || s.baseCtx == nil || s.newMediaArmed {
+		s.mu.Unlock()
+		return
+	}
+	s.newMediaArmed = true
+	ctx, cancel := context.WithCancel(s.baseCtx)
+	s.newMediaCancel = cancel
+	s.newMediaGen++
+	gen := s.newMediaGen
+	poll, quiet, maxWait := s.newMediaPoll, s.newMediaQuiet, s.newMediaMaxWait
+	s.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		disarm := func() bool {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.newMediaGen != gen || !s.newMediaArmed {
+				return false
+			}
+			s.newMediaArmed = false
+			s.newMediaCancel = nil
+			return true
+		}
+		deadline := time.Now().Add(maxWait)
+		var idleSince time.Time
+		ticker := time.NewTicker(poll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				disarm()
+				return
+			case <-ticker.C:
+			}
+			if time.Now().After(deadline) {
+				s.logger.Info("new media pass abandoned; next scheduled pass will continue")
+				disarm()
+				return
+			}
+			s.mu.Lock()
+			running := s.running
+			s.mu.Unlock()
+			if running || s.busyReason() != "" {
+				idleSince = time.Time{}
+				continue
+			}
+			if idleSince.IsZero() {
+				idleSince = time.Now()
+			}
+			if time.Since(idleSince) < quiet {
+				continue
+			}
+			// Disarm before running so media added during this pass queues a follow-up.
+			if !disarm() {
+				return // canceled in the meantime
+			}
+			s.logger.Info("generating chapter stills and trickplay for new media")
+			if _, err := s.runOnce(s.baseCtx, TriggerNewMedia, taskNewMedia); err != nil {
+				if errors.Is(err, ErrAlreadyRunning) {
+					s.NotifyMediaAdded()
+				} else {
+					s.logger.Warn("new media pass failed", "error", err)
 				}
 			}
 			return

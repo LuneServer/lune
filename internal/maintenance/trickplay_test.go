@@ -180,6 +180,9 @@ func TestConfigTrickplayDefaultsAndValidation(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	if !DefaultConfig().GenerateTrickplay {
+		t.Fatal("trickplay should be on by default for fresh installs")
+	}
 	for _, bad := range []Config{{TrickplayIntervalSeconds: 1, TrickplayWidth: 320}, {TrickplayIntervalSeconds: 10, TrickplayWidth: 321}, {TrickplayIntervalSeconds: 10, TrickplayWidth: 1000}} {
 		b := c
 		b.TrickplayIntervalSeconds, b.TrickplayWidth = bad.TrickplayIntervalSeconds, bad.TrickplayWidth
