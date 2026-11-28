@@ -20,7 +20,9 @@ import (
 
 	"github.com/LuneServer/lune/internal/library"
 	"github.com/LuneServer/lune/internal/metadata"
+	"github.com/LuneServer/lune/internal/segments"
 	"github.com/LuneServer/lune/internal/store"
+	"github.com/LuneServer/lune/internal/version"
 )
 
 const streamTokenTTL = 6 * time.Hour
@@ -80,26 +82,29 @@ type SubtitleStreamDTO struct {
 
 // PlaybackPlan is returned to clients after capability negotiation.
 type PlaybackPlan struct {
-	SessionID             string                  `json:"session_id"`
-	ItemID                string                  `json:"item_id"`
-	Mode                  string                  `json:"mode"` // "direct" | "remux" | "transcode"
-	Reason                string                  `json:"reason"`
-	VideoCopy             bool                    `json:"video_copy"`
-	AudioCopy             bool                    `json:"audio_copy"`
-	HWAccel               string                  `json:"hw_accel,omitempty"`
-	StreamURL             string                  `json:"stream_url"`
-	MimeType              string                  `json:"mime_type"`
-	AudioTracks           []AudioTrackDTO         `json:"audio_tracks"`
-	Subtitles             []SubtitleStreamDTO     `json:"subtitles"`
-	SelectedAudioIndex    *int                    `json:"selected_audio_index,omitempty"`
-	SelectedSubtitleIndex *int                    `json:"selected_subtitle_index,omitempty"`
-	BurnSubtitleStreamIdx *int                    `json:"burn_subtitle_stream_index,omitempty"`
-	Chapters              []metadata.ChapterInfo  `json:"chapters"`
-	Trickplay             *metadata.TrickplayInfo `json:"trickplay,omitempty"`
-	TranscodeEnabled      bool                    `json:"transcode_enabled"`
-	ResumePositionMS      int64                   `json:"resume_position_ms"`
-	DurationMS            int64                   `json:"duration_ms"`
-	ExpiresAt             time.Time               `json:"expires_at"`
+	SessionID             string                 `json:"session_id"`
+	ItemID                string                 `json:"item_id"`
+	Mode                  string                 `json:"mode"` // "direct" | "remux" | "transcode"
+	Reason                string                 `json:"reason"`
+	VideoCopy             bool                   `json:"video_copy"`
+	AudioCopy             bool                   `json:"audio_copy"`
+	HWAccel               string                 `json:"hw_accel,omitempty"`
+	StreamURL             string                 `json:"stream_url"`
+	MimeType              string                 `json:"mime_type"`
+	AudioTracks           []AudioTrackDTO        `json:"audio_tracks"`
+	Subtitles             []SubtitleStreamDTO    `json:"subtitles"`
+	SelectedAudioIndex    *int                   `json:"selected_audio_index,omitempty"`
+	SelectedSubtitleIndex *int                   `json:"selected_subtitle_index,omitempty"`
+	BurnSubtitleStreamIdx *int                   `json:"burn_subtitle_stream_index,omitempty"`
+	Chapters              []metadata.ChapterInfo `json:"chapters"`
+	// Segments are the skippable spans (intro/recap/outro/preview): container chapters first,
+	// IntroDB timestamps for kinds the chapters do not cover.
+	Segments         []segments.Segment      `json:"segments"`
+	Trickplay        *metadata.TrickplayInfo `json:"trickplay,omitempty"`
+	TranscodeEnabled bool                    `json:"transcode_enabled"`
+	ResumePositionMS int64                   `json:"resume_position_ms"`
+	DurationMS       int64                   `json:"duration_ms"`
+	ExpiresAt        time.Time               `json:"expires_at"`
 }
 
 // ActiveStream represents a currently active playback session visible to admins.
@@ -147,6 +152,7 @@ type Service struct {
 	secret     []byte
 	logger     *slog.Logger
 	now        func() time.Time
+	segments   *segments.Resolver
 
 	mu      sync.Mutex
 	active  map[string]*ActiveStream
@@ -175,12 +181,15 @@ func NewService(ctx context.Context, s *store.Store, dataDir string, logger *slo
 	}
 
 	transcoder := NewTranscoder(dataDir, logger)
+	resolver := segments.NewResolver(s, segments.NewIntroDBClient("Lune/"+version.Version), logger)
 	if raw, err := s.GetSetting(ctx, StreamingConfigSettingKey); err == nil && strings.TrimSpace(raw) != "" {
-		var cfg StreamingConfig
+		// Configs saved before introdb_enabled existed keep the default (on).
+		cfg := StreamingConfig{IntroDBEnabled: true}
 		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 			logger.Warn("ignoring invalid persisted streaming_config", "error", err)
 		} else {
 			transcoder.UpdateConfig(cfg)
+			resolver.SetEnabled(cfg.IntroDBEnabled)
 		}
 	}
 
@@ -191,6 +200,7 @@ func NewService(ctx context.Context, s *store.Store, dataDir string, logger *slo
 		secret:     secret,
 		logger:     logger,
 		now:        time.Now,
+		segments:   resolver,
 		active:     make(map[string]*ActiveStream),
 		revoked:    make(map[string]time.Time),
 	}, nil
@@ -198,7 +208,14 @@ func NewService(ctx context.Context, s *store.Store, dataDir string, logger *slo
 
 // GetStreamingConfig returns the active live streaming/transcoding configuration.
 func (s *Service) GetStreamingConfig() StreamingConfig {
-	return s.transcoder.GetConfig()
+	cfg := s.transcoder.GetConfig()
+	cfg.IntroDBEnabled = s.segments.Enabled()
+	return cfg
+}
+
+// SetSegmentResolver replaces the skip-segment resolver (tests inject a fake IntroDB).
+func (s *Service) SetSegmentResolver(r *segments.Resolver) {
+	s.segments = r
 }
 
 // ActiveTranscodeDirs returns the set of directory paths owned by live transcode sessions.
@@ -261,20 +278,22 @@ func (s *Service) UpdateStreamingConfig(ctx context.Context, actor store.User, c
 	}
 
 	s.transcoder.UpdateConfig(cfg)
+	s.segments.SetEnabled(cfg.IntroDBEnabled)
 
 	_ = s.store.InsertAuditEvent(ctx, store.AuditEvent{
 		EventType: "admin.streaming_config_updated",
 		ActorID:   actor.ID,
 		ClientIP:  clientIP,
 		Detail: fmt.Sprintf(
-			"max_global_transcodes=%d max_user_transcodes=%d idle_timeout_minutes=%d",
+			"max_global_transcodes=%d max_user_transcodes=%d idle_timeout_minutes=%d introdb_enabled=%t",
 			cfg.MaxGlobalTranscodes,
 			cfg.MaxUserTranscodes,
 			cfg.IdleTimeoutMinutes,
+			cfg.IntroDBEnabled,
 		),
 	})
 
-	return s.transcoder.GetConfig(), nil
+	return s.GetStreamingConfig(), nil
 }
 
 // Shutdown terminates active transcode workers cleanly.
@@ -341,6 +360,20 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		chapters = []metadata.ChapterInfo{}
 	}
 	metadata.PopulateChapterThumbnails(s.dataDir, item.ID, chapters)
+
+	// Resolve skip segments (may wait briefly on an uncached IntroDB lookup) alongside the rest
+	// of negotiation, and warm the next episode's lookup so it is cached when Up Next plays.
+	segmentsCh := make(chan []segments.Segment, 1)
+	go func() { segmentsCh <- s.segments.Resolve(ctx, item, chapters) }()
+	if item.Kind == "episode" && s.segments.Enabled() {
+		go func() {
+			nctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if next, err := s.store.GetNextEpisode(nctx, item.ID); err == nil {
+				s.segments.Prefetch(next)
+			}
+		}()
+	}
 
 	// Build full subtitle list (sidecar + embedded text tracks when FFmpeg is available).
 	// Token is needed for URLs, so first compute preferred audio track to decide playback mode.
@@ -583,6 +616,7 @@ func (s *Service) Negotiate(ctx context.Context, user store.User, itemID string,
 		SelectedSubtitleIndex: selectedSubIdx,
 		BurnSubtitleStreamIdx: validBurnSubIdx,
 		Chapters:              chapters,
+		Segments:              <-segmentsCh,
 		Trickplay:             metadata.LoadTrickplay(s.dataDir, item.ID),
 		TranscodeEnabled:      s.transcoder.Available(),
 		ResumePositionMS:      resumeMS,

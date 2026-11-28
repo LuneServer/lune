@@ -114,6 +114,8 @@ type UpdateStreamingConfigInput struct {
 		MaxGlobalTranscodes int `json:"max_global_transcodes,omitempty"`
 		MaxUserTranscodes   int `json:"max_user_transcodes,omitempty"`
 		IdleTimeoutMinutes  int `json:"idle_timeout_minutes,omitempty"`
+		// IntroDBEnabled toggles introdb.app skip-segment lookups; omitted keeps the current value.
+		IntroDBEnabled *bool `json:"introdb_enabled,omitempty" required:"false"`
 	}
 }
 
@@ -361,7 +363,7 @@ func registerPlaybackRoutes(r chi.Router, api huma.API, streamSvc *stream.Servic
 		OperationID: "admin-update-streaming-config",
 		Method:      http.MethodPut,
 		Path:        "/api/v1/admin/streaming/config",
-		Summary:     "Update live transcoding concurrency and idle timeout settings (admin only)",
+		Summary:     "Update live transcoding concurrency, idle timeout and IntroDB lookup settings (admin only)",
 		Tags:        []string{"Admin"},
 	}, func(ctx context.Context, in *UpdateStreamingConfigInput) (*StreamingConfigResponse, error) {
 		user, _, ok := currentPrincipal(ctx)
@@ -371,10 +373,15 @@ func registerPlaybackRoutes(r chi.Router, api huma.API, streamSvc *stream.Servic
 		if user.Role != "admin" {
 			return nil, huma.Error403Forbidden("administrator privileges required")
 		}
+		introDB := streamSvc.GetStreamingConfig().IntroDBEnabled
+		if in.Body.IntroDBEnabled != nil {
+			introDB = *in.Body.IntroDBEnabled
+		}
 		updated, err := streamSvc.UpdateStreamingConfig(ctx, user, stream.StreamingConfig{
 			MaxGlobalTranscodes: in.Body.MaxGlobalTranscodes,
 			MaxUserTranscodes:   in.Body.MaxUserTranscodes,
 			IdleTimeoutMinutes:  in.Body.IdleTimeoutMinutes,
+			IntroDBEnabled:      introDB,
 		}, clientIPFromContext(ctx))
 		if err != nil {
 			if errors.Is(err, stream.ErrInvalidStreamingConfig) {

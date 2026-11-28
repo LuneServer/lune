@@ -211,6 +211,10 @@ func TestAnimeLibraryFirstClassFlow(t *testing.T) {
 	if len(plan.Chapters) != 3 || plan.Chapters[0].Kind != "intro" || plan.Chapters[2].Kind != "outro" {
 		t.Fatalf("expected 3 chapters with intro/outro, got %+v", plan.Chapters)
 	}
+	if len(plan.Segments) != 2 || plan.Segments[0].Kind != "intro" || plan.Segments[0].Source != "chapter" ||
+		plan.Segments[1].Kind != "outro" {
+		t.Fatalf("expected intro/outro chapter segments, got %+v", plan.Segments)
+	}
 
 	// Fetch sidecar ASS subtitle converted to WebVTT on the fly.
 	var sidecarSub *stream.SubtitleStreamDTO

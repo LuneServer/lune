@@ -432,7 +432,7 @@ func TestAdminStreamingConfigEndpoints(t *testing.T) {
 	}
 	var cfg stream.StreamingConfig
 	_ = json.Unmarshal(rec.Body.Bytes(), &cfg)
-	if cfg.MaxGlobalTranscodes != 0 || cfg.MaxUserTranscodes != 3 || cfg.IdleTimeoutMinutes != 10 {
+	if cfg.MaxGlobalTranscodes != 0 || cfg.MaxUserTranscodes != 3 || cfg.IdleTimeoutMinutes != 10 || !cfg.IntroDBEnabled {
 		t.Fatalf("unexpected default streaming config: %+v", cfg)
 	}
 
@@ -494,6 +494,31 @@ func TestAdminStreamingConfigEndpoints(t *testing.T) {
 		loaded.MaxUserTranscodes != updated.MaxUserTranscodes ||
 		loaded.IdleTimeoutMinutes != updated.IdleTimeoutMinutes {
 		t.Fatalf("reloaded streaming config = %+v, want %+v", loaded, updated)
+	}
+
+	// introdb_enabled survived a PUT that omitted it; turning it off persists across restarts.
+	if !updated.IntroDBEnabled {
+		t.Fatalf("PUT without introdb_enabled turned IntroDB off: %+v", updated)
+	}
+	rec = doJSON(t, h, http.MethodPut, "/api/v1/admin/streaming/config", map[string]any{
+		"max_global_transcodes": 6,
+		"max_user_transcodes":   2,
+		"idle_timeout_minutes":  15,
+		"introdb_enabled":       false,
+	}, adminCookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin PUT introdb_enabled=false status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if streamSvc.GetStreamingConfig().IntroDBEnabled {
+		t.Fatal("live IntroDBEnabled still true after disabling")
+	}
+	restarted2, err := stream.NewService(ctx, db, dataDir, nil)
+	if err != nil {
+		t.Fatalf("restarted stream.NewService: %v", err)
+	}
+	defer restarted2.Shutdown()
+	if restarted2.GetStreamingConfig().IntroDBEnabled {
+		t.Fatal("reloaded IntroDBEnabled = true after disabling")
 	}
 
 	// Audit event recorded.

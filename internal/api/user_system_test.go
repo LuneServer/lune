@@ -161,6 +161,9 @@ func TestUserSystemSelfServiceProfilePasswordAvatarAndSessions(t *testing.T) {
 	if prof.Username != "dan" || !prof.AllLibraries || !prof.Preferences.AutoplayNext || prof.ActiveSessions != 2 || prof.LastLoginAt == nil {
 		t.Fatalf("unexpected profile: %+v", prof)
 	}
+	if p := prof.Preferences; p.AutoSkipIntro != "countdown" || p.AutoSkipRecap != "countdown" || p.AutoSkipCredits != "off" {
+		t.Fatalf("unexpected default auto-skip preferences: %+v", p)
+	}
 
 	// 2. PATCH /api/v1/users/me updates display_name & preferences.
 	rec = doJSON(t, h, http.MethodPatch, "/api/v1/users/me", map[string]any{
@@ -201,6 +204,27 @@ func TestUserSystemSelfServiceProfilePasswordAvatarAndSessions(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &prof)
 	if !prof.Preferences.ShowChapterMarkers {
 		t.Fatalf("show_chapter_markers = false after re-enabling: %+v", prof.Preferences)
+	}
+
+	// 2c. auto_skip_* round-trip; omitted modes fall back to defaults; unknown modes are rejected.
+	rec = doJSON(t, h, http.MethodPatch, "/api/v1/users/me", map[string]any{
+		"preferences": map[string]any{"autoplay_next": true, "subtitles_enabled": false, "show_chapter_markers": true,
+			"auto_skip_intro": "instant", "auto_skip_credits": "countdown"},
+	}, adminCookie, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH auto_skip status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodGet, "/api/v1/users/me", nil, adminCookie, "")
+	prof = UserProfileDTO{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &prof)
+	if p := prof.Preferences; p.AutoSkipIntro != "instant" || p.AutoSkipRecap != "countdown" || p.AutoSkipCredits != "countdown" {
+		t.Fatalf("auto-skip preferences after PATCH = %+v", p)
+	}
+	rec = doJSON(t, h, http.MethodPatch, "/api/v1/users/me", map[string]any{
+		"preferences": map[string]any{"autoplay_next": true, "subtitles_enabled": false, "auto_skip_intro": "sometimes"},
+	}, adminCookie, "")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("PATCH invalid auto_skip_intro status = %d, want 422", rec.Code)
 	}
 
 	// 3. Avatar upload (rejects invalid MIME, accepts PNG via multipart, serves image, deletes).

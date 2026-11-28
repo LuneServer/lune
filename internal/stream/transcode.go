@@ -55,10 +55,13 @@ type TranscoderStatus struct {
 
 // StreamingConfig controls live transcoder concurrency caps and idle cleanup.
 type StreamingConfig struct {
-	MaxGlobalTranscodes int               `json:"max_global_transcodes"` // 0 = unlimited
-	MaxUserTranscodes   int               `json:"max_user_transcodes"`   // 0 = unlimited
-	IdleTimeoutMinutes  int               `json:"idle_timeout_minutes"`  // 1..120 (default 10)
-	Transcoder          *TranscoderStatus `json:"transcoder,omitempty"`  // read-only runtime diagnostics
+	MaxGlobalTranscodes int `json:"max_global_transcodes"` // 0 = unlimited
+	MaxUserTranscodes   int `json:"max_user_transcodes"`   // 0 = unlimited
+	IdleTimeoutMinutes  int `json:"idle_timeout_minutes"`  // 1..120 (default 10)
+	// IntroDBEnabled looks up intro/recap/credits timestamps on introdb.app (default true). It
+	// sends the title's IMDb ID and season/episode numbers to IntroDB; nothing about the user.
+	IntroDBEnabled bool              `json:"introdb_enabled"`
+	Transcoder     *TranscoderStatus `json:"transcoder,omitempty"` // read-only runtime diagnostics
 }
 
 // HWAccel identifies the video encoder backend selected for transcoding.
