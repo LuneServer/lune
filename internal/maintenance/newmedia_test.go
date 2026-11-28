@@ -13,6 +13,11 @@ import (
 
 func newMediaTestService(t *testing.T, busy *atomic.Bool) *Service {
 	t.Helper()
+	return newMediaTestServiceWithPlayback(t, busy, nil)
+}
+
+func newMediaTestServiceWithPlayback(t *testing.T, busy, playing *atomic.Bool) *Service {
+	t.Helper()
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	db, err := store.Open(ctx, filepath.Join(dataDir, "lune.db"))
@@ -24,6 +29,9 @@ func newMediaTestService(t *testing.T, busy *atomic.Bool) *Service {
 		DataDir:       dataDir,
 		IsScanRunning: busy.Load,
 	})
+	if playing != nil {
+		svc.isPlaybackActive = playing.Load
+	}
 	if svc.ffmpegBin == "" {
 		t.Skip("ffmpeg not found on PATH")
 	}
@@ -52,8 +60,8 @@ func TestNotifyMediaAdded_WaitsForScanThenRunsPerItemTasks(t *testing.T) {
 	busy.Store(true) // the scan that found the media is still finishing
 	svc := newMediaTestService(t, &busy)
 
-	svc.NotifyMediaAdded()
-	svc.NotifyMediaAdded() // coalesces
+	svc.NotifyMediaAdded([]string{"item-1"})
+	svc.NotifyMediaAdded([]string{"item-1"}) // coalesces
 	if !svc.Status().NewMediaPending {
 		t.Fatal("expected a queued new-media pass")
 	}
@@ -81,7 +89,7 @@ func TestNotifyMediaAdded_DuringRunningPassQueuesFollowUp(t *testing.T) {
 	svc.running = true
 	svc.mu.Unlock()
 
-	svc.NotifyMediaAdded()
+	svc.NotifyMediaAdded([]string{"item-1"})
 	time.Sleep(60 * time.Millisecond)
 	if st := svc.Status(); st.LastRun != nil || !st.NewMediaPending {
 		t.Fatalf("follow-up must wait for the running pass: %+v", st)
@@ -109,7 +117,7 @@ func TestNotifyMediaAdded_RespectsConfig(t *testing.T) {
 		if _, err := svc.UpdateConfig(context.Background(), cfg); err != nil {
 			t.Fatal(err)
 		}
-		svc.NotifyMediaAdded()
+		svc.NotifyMediaAdded([]string{"item-1"})
 		if svc.Status().NewMediaPending {
 			t.Fatalf("%s: queued a new-media pass", name)
 		}
@@ -120,7 +128,7 @@ func TestCancelRun_DropsPendingNewMediaPass(t *testing.T) {
 	var busy atomic.Bool
 	busy.Store(true)
 	svc := newMediaTestService(t, &busy)
-	svc.NotifyMediaAdded()
+	svc.NotifyMediaAdded([]string{"item-1"})
 	if !svc.CancelRun() {
 		t.Fatal("expected CancelRun to report the dropped pass")
 	}
@@ -138,7 +146,7 @@ func TestNotifyMediaAdded_ConcurrentNotifiesRunOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Add(1)
-		go func() { defer wg.Done(); svc.NotifyMediaAdded() }()
+		go func() { defer wg.Done(); svc.NotifyMediaAdded([]string{"item-1"}) }()
 	}
 	wg.Wait()
 	svc.mu.Lock()
@@ -166,5 +174,85 @@ func TestComputeNextRun_BackgroundRunsDoNotMoveRollingSchedule(t *testing.T) {
 	manual := &RunReport{Trigger: TriggerManual, FinishedAt: time.Date(2026, 11, 26, 11, 0, 0, 0, loc)}
 	if got, want := computeNextRun(now, cfg, manual, scheduledAt, loc), manual.FinishedAt.Add(24*time.Hour); !got.Equal(want) {
 		t.Fatalf("manual: got %v, want %v", got, want)
+	}
+}
+
+func TestBusyReasonFor_NewMediaPassIgnoresDirectPlayOnly(t *testing.T) {
+	var scanning, playing atomic.Bool
+	transcodes := map[string]struct{}{}
+	svc := &Service{
+		isScanRunning:       scanning.Load,
+		isPlaybackActive:    playing.Load,
+		activeTranscodeDirs: func() map[string]struct{} { return transcodes },
+	}
+	backlog := context.Background()
+	newMedia := withNewMediaScope(backlog, map[string]struct{}{"a": {}})
+
+	playing.Store(true) // direct play: no FFmpeg session
+	if got := svc.busyReasonFor(backlog); got != BusyReasonPlayback {
+		t.Fatalf("backlog pass during direct play: %q, want %q", got, BusyReasonPlayback)
+	}
+	if got := svc.busyReasonFor(newMedia); got != "" {
+		t.Fatalf("new-media pass during direct play: %q, want idle", got)
+	}
+
+	transcodes["session"] = struct{}{}
+	if got := svc.busyReasonFor(newMedia); got != BusyReasonPlayback {
+		t.Fatalf("new-media pass during a transcode: %q, want %q", got, BusyReasonPlayback)
+	}
+	delete(transcodes, "session")
+
+	scanning.Store(true)
+	if got := svc.busyReasonFor(newMedia); got != BusyReasonScan {
+		t.Fatalf("new-media pass during a scan: %q, want %q", got, BusyReasonScan)
+	}
+}
+
+func TestNewMediaScope_IncludesOnlyScannedItems(t *testing.T) {
+	var none *newMediaScope
+	if !none.includes("anything") {
+		t.Fatal("backlog passes must include every item")
+	}
+	sc := newMediaScopeFrom(withNewMediaScope(context.Background(), map[string]struct{}{"a": {}}))
+	if !sc.includes("a") || sc.includes("b") {
+		t.Fatal("new-media scope must include only the scanned items")
+	}
+}
+
+func TestNotifyMediaAdded_RunsDuringDirectPlay(t *testing.T) {
+	var scanning, playing atomic.Bool
+	playing.Store(true)
+	svc := newMediaTestServiceWithPlayback(t, &scanning, &playing)
+
+	svc.NotifyMediaAdded([]string{"item-1"})
+	rep := waitForLastRun(t, svc, TriggerNewMedia)
+	if rep.Outcome != OutcomeCompleted {
+		t.Fatalf("new-media pass during direct play: %+v", rep)
+	}
+}
+
+func TestNotifyMediaAdded_CoalescesItemIDs(t *testing.T) {
+	var busy atomic.Bool
+	busy.Store(true)
+	svc := newMediaTestService(t, &busy)
+
+	svc.NotifyMediaAdded(nil) // nothing changed: no pass
+	if svc.Status().NewMediaPending {
+		t.Fatal("queued a pass without items")
+	}
+	svc.NotifyMediaAdded([]string{"a", "b"})
+	svc.NotifyMediaAdded([]string{"b", "c"})
+	svc.mu.Lock()
+	n, gen := len(svc.newMediaIDs), svc.newMediaGen
+	svc.mu.Unlock()
+	if n != 3 || gen != 1 {
+		t.Fatalf("queued items = %d, passes = %d; want 3 items in 1 pass", n, gen)
+	}
+	svc.CancelRun()
+	svc.mu.Lock()
+	n = len(svc.newMediaIDs)
+	svc.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("CancelRun left %d queued items", n)
 	}
 }

@@ -277,7 +277,10 @@ func TestScanCallsMediaChangedHookOnlyForFileChanges(t *testing.T) {
 	_ = os.WriteFile(ep, []byte("x"), 0o644)
 	svc := NewService(db, ctxCheckingProber{}, nil)
 	var calls int
-	svc.SetMediaChangedHook(func() {
+	svc.SetMediaChangedHook(func(ids []string) {
+		if len(ids) != 1 {
+			t.Errorf("hook item IDs = %v, want the one changed file", ids)
+		}
 		if svc.HasRunningScan() {
 			t.Error("hook ran before the scan was marked finished")
 		}
