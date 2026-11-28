@@ -323,18 +323,22 @@ func (s *Service) extractChapterStill(ctx context.Context, filePath, seekSec str
 		cmd := exec.CommandContext(cmdCtx, s.ffmpegBin,
 			"-nostdin",
 			"-loglevel", "error",
+			// -threads before -i only limits the decoder; filters and the encoder need
+			// their own limits or they start a thread per core.
 			"-threads", "1",
+			"-filter_threads", "1",
 			"-ss", seekSec,
 			"-i", filePath,
 			"-map", "0:v:0",
 			"-frames:v", "1",
 			"-vf", vf,
+			"-threads", "1",
 			"-q:v", "4",
 			"-f", "image2",
 			"-y",
 			tmpPath,
 		)
-		if err := cmd.Run(); err != nil {
+		if err := runBackground(cmd); err != nil {
 			return err
 		}
 		info, err := os.Stat(tmpPath)

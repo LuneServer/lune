@@ -53,10 +53,9 @@ import (
 //   - each tile is the keyframe at or before its slot, so precision is the smaller of the
 //     interval and the source's keyframe spacing.
 const (
-	trickplayManifestVersion  = 3 // v3: black bars cropped, tiles fit within a 16:9 box
-	trickplayColumns          = 10
-	trickplayRows             = 10
-	trickplayMaxActivePerItem = 90 * time.Minute // CPU-time budget per FFmpeg call (paused time excluded)
+	trickplayManifestVersion = 3 // v3: black bars cropped, tiles fit within a 16:9 box
+	trickplayColumns         = 10
+	trickplayRows            = 10
 	// Tiles fit inside width x (width*9/16): letterboxed (cropped) titles get shorter tiles and
 	// pillarboxed 4:3 titles narrower ones, so cropping never makes a tile larger than 16:9.
 	trickplayFitScale = "scale=%d:%d:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=bicubic"
@@ -67,12 +66,21 @@ const (
 var (
 	trickplayBusyPoll       = 2 * time.Second
 	trickplayMaxPausePerRun = 6 * time.Hour // give up for this run if playback never stops
+	// trickplayMaxCPUPerItem is the CPU time one FFmpeg call may use. It is measured from the
+	// kernel where possible (Linux), so a low-priority job starved by other work is not
+	// mistaken for a stuck one; elsewhere unpaused wall time stands in for it.
+	trickplayMaxCPUPerItem = 90 * time.Minute
+	// trickplayMaxWallPerItem bounds unpaused wall time when CPU time is measured, catching a
+	// job stalled on I/O (e.g. a hung network mount). Hitting it skips the item for this run
+	// instead of marking it failed.
+	trickplayMaxWallPerItem = 6 * time.Hour
 	// forceTrickplayFormat pins the sheet format (tests only); empty means probe.
 	forceTrickplayFormat = ""
 )
 
 var (
 	errTrickplayBusyTimeout = errors.New("trickplay generation paused too long")
+	errTrickplayStalled     = errors.New("trickplay generation made too little progress")
 	showinfoFrameRE         = regexp.MustCompile(`Parsed_showinfo.*\bn:\s*(\d+).*\bpts_time:\s*(-?[0-9.]+)`)
 )
 
@@ -215,6 +223,9 @@ func (s *Service) generateTrickplay(ctx context.Context, cfg Config, onProgress 
 		case errors.Is(err, errTrickplayBusyTimeout):
 			res.SkippedBusy = true
 			return res, nil
+		case errors.Is(err, errTrickplayStalled):
+			// Starved or stalled rather than broken: no failed marker, retry next run.
+			s.logger.Warn("trickplay generation stalled; will retry next run", "item_id", item.ID, "error", err)
 		default:
 			s.logger.Debug("trickplay generation failed", "item_id", item.ID, "error", err)
 			itemDir := metadata.TrickplayDir(s.dataDir, item.ID)
@@ -459,6 +470,16 @@ func (s *Service) renderTrickplayTiles(ctx context.Context, filePath, outDir, sc
 	return stamps, nil
 }
 
+// runBackground runs a short FFmpeg job (a chapter still or cropdetect sample) at background
+// priority. These finish in seconds, so they skip runPausableFFmpeg's pause handling.
+func runBackground(cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	lowerProcessPriority(cmd)
+	return cmd.Wait()
+}
+
 // runPausableFFmpeg runs FFmpeg at background priority, SIGSTOPping it while a scan or
 // transcode is active. onLine may consume stderr lines (returning true); other lines are kept
 // as error context.
@@ -508,7 +529,7 @@ func (s *Service) runPausableFFmpeg(ctx context.Context, args []string, pausedBu
 	var (
 		paused     bool
 		pausedAt   time.Time
-		activeTime time.Duration
+		activeWall time.Duration
 		lastTick   = time.Now()
 		budgetErr  error
 	)
@@ -559,9 +580,18 @@ func (s *Service) runPausableFFmpeg(ctx context.Context, args []string, pausedBu
 				budgetErr = errTrickplayBusyTimeout
 				cancel()
 			case !paused:
-				activeTime += now.Sub(lastTick)
-				if activeTime > trickplayMaxActivePerItem {
-					budgetErr = fmt.Errorf("exceeded %s CPU budget", trickplayMaxActivePerItem)
+				activeWall += now.Sub(lastTick)
+				if cpu, ok := cpuTimeOf(cmd); ok {
+					switch {
+					case cpu > trickplayMaxCPUPerItem:
+						budgetErr = fmt.Errorf("exceeded %s CPU budget", trickplayMaxCPUPerItem)
+						cancel()
+					case activeWall > trickplayMaxWallPerItem:
+						budgetErr = fmt.Errorf("%w: %s CPU in %s", errTrickplayStalled, cpu.Round(time.Second), activeWall.Round(time.Second))
+						cancel()
+					}
+				} else if activeWall > trickplayMaxCPUPerItem {
+					budgetErr = fmt.Errorf("exceeded %s budget", trickplayMaxCPUPerItem)
 					cancel()
 				}
 			}
