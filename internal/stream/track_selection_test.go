@@ -47,6 +47,7 @@ func TestAnimeAudioSelection(t *testing.T) {
 		wantSub   int // -1 = none
 	}{
 		{"anime subbed", audio, subbed, true, 0, full},
+		{"anime with nothing stored is subbed", []AudioTrackDTO{{Index: 0, Language: "en", Default: true}, {Index: 1, Language: "ja"}}, store.UserPreferences{SubtitleLanguage: "en"}, true, 1, full},
 		{"anime subbed ignores global en audio", audio, store.UserPreferences{AudioLanguage: "en", SubtitleLanguage: "en", AnimeAudio: "subbed"}, true, 0, full},
 		{"anime subbed with only an English track", enOnly, subbed, true, 0, signs},
 		{"anime dubbed", audio, dubbed, true, 1, signs},
@@ -61,7 +62,7 @@ func TestAnimeAudioSelection(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			aIdx, aLang := selectPreferredAudio(tc.tracks, nil, tc.prefs, tc.anime, true)
+			aIdx, aLang := selectPreferredAudio(tc.tracks, nil, tc.prefs, tc.anime)
 			if aIdx == nil || *aIdx != tc.wantAudio {
 				t.Fatalf("audio = %v, want %d", aIdx, tc.wantAudio)
 			}

@@ -780,28 +780,24 @@ func TestUserPreferencesAnimeAudioSyncAndPreserve(t *testing.T) {
 		return prof.Preferences.AnimeAudio
 	}
 
-	if got := read(); got != "" {
-		t.Fatalf("expected no anime_audio by default, got %q", got)
+	if got := read(); got != "subbed" {
+		t.Fatalf("expected subbed by default, got %q", got)
 	}
-	if rec := patch(map[string]any{"anime_audio": "subbed"}); rec.Code != http.StatusOK {
+	if rec := patch(map[string]any{"anime_audio": "dubbed"}); rec.Code != http.StatusOK {
 		t.Fatalf("PATCH status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if got := read(); got != "subbed" {
-		t.Fatalf("anime_audio = %q, want subbed", got)
+	if got := read(); got != "dubbed" {
+		t.Fatalf("anime_audio = %q, want dubbed", got)
 	}
-	// Older clients that omit the field keep it.
+	// An update that omits it keeps it.
 	if rec := patch(map[string]any{}); rec.Code != http.StatusOK {
-		t.Fatalf("PATCH (legacy client) status = %d, body = %s", rec.Code, rec.Body.String())
+		t.Fatalf("PATCH (omitted) status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if got := read(); got != "subbed" {
-		t.Fatalf("anime_audio after legacy update = %q, want subbed", got)
+	if got := read(); got != "dubbed" {
+		t.Fatalf("anime_audio after omitted update = %q, want dubbed", got)
 	}
-	// "auto" clears it.
-	if rec := patch(map[string]any{"anime_audio": "auto"}); rec.Code != http.StatusOK {
-		t.Fatalf("PATCH auto status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	if got := read(); got != "" {
-		t.Fatalf("anime_audio after auto = %q, want empty", got)
+	if rec := patch(map[string]any{"anime_audio": "auto"}); rec.Code < 400 || rec.Code >= 500 {
+		t.Fatalf("expected 4xx for auto, got %d", rec.Code)
 	}
 	if rec := patch(map[string]any{"anime_audio": "both"}); rec.Code < 400 || rec.Code >= 500 {
 		t.Fatalf("expected 4xx for unknown anime_audio, got %d", rec.Code)
