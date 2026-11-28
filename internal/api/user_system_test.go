@@ -760,3 +760,50 @@ func TestUserPreferencesSubtitleStyleSyncAndPreserve(t *testing.T) {
 		t.Fatalf("expected 4xx for invalid size, got %d", rec.Code)
 	}
 }
+
+func TestUserPreferencesAnimeAudioSyncAndPreserve(t *testing.T) {
+	h, adminCookie, _, _, _, _ := setupUserSystemFixture(t)
+
+	patch := func(prefs map[string]any) *httptest.ResponseRecorder {
+		t.Helper()
+		prefs["subtitles_enabled"] = false
+		prefs["autoplay_next"] = true
+		return doJSON(t, h, http.MethodPatch, "/api/v1/users/me", map[string]any{"preferences": prefs}, adminCookie, "")
+	}
+	read := func() string {
+		t.Helper()
+		rec := doJSON(t, h, http.MethodGet, "/api/v1/users/me", nil, adminCookie, "")
+		var prof UserProfileDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &prof); err != nil {
+			t.Fatal(err)
+		}
+		return prof.Preferences.AnimeAudio
+	}
+
+	if got := read(); got != "" {
+		t.Fatalf("expected no anime_audio by default, got %q", got)
+	}
+	if rec := patch(map[string]any{"anime_audio": "subbed"}); rec.Code != http.StatusOK {
+		t.Fatalf("PATCH status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := read(); got != "subbed" {
+		t.Fatalf("anime_audio = %q, want subbed", got)
+	}
+	// Older clients that omit the field keep it.
+	if rec := patch(map[string]any{}); rec.Code != http.StatusOK {
+		t.Fatalf("PATCH (legacy client) status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := read(); got != "subbed" {
+		t.Fatalf("anime_audio after legacy update = %q, want subbed", got)
+	}
+	// "auto" clears it.
+	if rec := patch(map[string]any{"anime_audio": "auto"}); rec.Code != http.StatusOK {
+		t.Fatalf("PATCH auto status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := read(); got != "" {
+		t.Fatalf("anime_audio after auto = %q, want empty", got)
+	}
+	if rec := patch(map[string]any{"anime_audio": "both"}); rec.Code < 400 || rec.Code >= 500 {
+		t.Fatalf("expected 4xx for unknown anime_audio, got %d", rec.Code)
+	}
+}
