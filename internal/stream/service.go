@@ -1572,10 +1572,17 @@ func selectPreferredAudio(tracks []AudioTrackDTO, explicitIdx *int, prefs store.
 	}
 
 	desiredLang := metadata.NormalizeLanguage(prefs.AudioLanguage)
-	// For anime libraries, when the user hasn't configured an explicit audio preference and
-	// subtitles are present, default to original Japanese audio when available.
-	if desiredLang == "" && isAnime && hasSubs {
+	switch animeAudioMode(prefs, isAnime) {
+	case store.AnimeAudioSubbed:
 		desiredLang = "ja"
+	case store.AnimeAudioDubbed:
+		desiredLang = mainLanguage(prefs)
+	default:
+		// For anime libraries, when the user hasn't configured an explicit audio preference and
+		// subtitles are present, default to original Japanese audio when available.
+		if desiredLang == "" && isAnime && hasSubs {
+			desiredLang = "ja"
+		}
 	}
 
 	if desiredLang != "" {
@@ -1597,6 +1604,28 @@ func selectPreferredAudio(tracks []AudioTrackDTO, explicitIdx *int, prefs store.
 	return &idx, metadata.NormalizeLanguage(tracks[0].Language)
 }
 
+// animeAudioMode returns the user's anime_audio mode for anime items, "" otherwise.
+func animeAudioMode(prefs store.UserPreferences, isAnime bool) string {
+	if !isAnime {
+		return ""
+	}
+	mode, _ := store.NormalizeAnimeAudio(prefs.AnimeAudio)
+	return mode
+}
+
+// mainLanguage is the language a dubbed viewer wants to hear: their audio language unless it
+// is Japanese (older clients stored "ja" for the subbed preset), else their subtitle language,
+// else English.
+func mainLanguage(prefs store.UserPreferences) string {
+	if l := metadata.NormalizeLanguage(prefs.AudioLanguage); l != "" && l != "ja" {
+		return l
+	}
+	if l := metadata.NormalizeLanguage(prefs.SubtitleLanguage); l != "" {
+		return l
+	}
+	return "en"
+}
+
 func selectPreferredSubtitle(subs []SubtitleStreamDTO, audioLang string, prefs store.UserPreferences, isAnime bool) *int {
 	if len(subs) == 0 {
 		return nil
@@ -1609,7 +1638,19 @@ func selectPreferredSubtitle(subs []SubtitleStreamDTO, audioLang string, prefs s
 	// Determine whether full dialogue subtitles should auto-enable:
 	// 1. User explicitly enabled subtitles in preferences, OR
 	// 2. Anime playback using Japanese (or non-preferred) audio -> auto-enable full subtitles in preferred language!
-	wantFull := prefs.SubtitlesEnabled || (isAnime && audioLang != "" && audioLang != prefSubLang)
+	//
+	// For anime with an explicit anime_audio mode, subtitles_enabled is ignored: subbed shows full
+	// subtitles unless the audio is already in the subtitle language, dubbed shows them only when
+	// no dub was found and the audio fell back to another language.
+	var wantFull bool
+	switch animeAudioMode(prefs, isAnime) {
+	case store.AnimeAudioSubbed:
+		wantFull = audioLang != prefSubLang
+	case store.AnimeAudioDubbed:
+		wantFull = audioLang != "" && audioLang != prefSubLang
+	default:
+		wantFull = prefs.SubtitlesEnabled || (isAnime && audioLang != "" && audioLang != prefSubLang)
+	}
 
 	if wantFull {
 		// Prefer non-forced (full dialogue) text track matching preferred subtitle language.
