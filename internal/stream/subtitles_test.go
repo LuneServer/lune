@@ -215,23 +215,64 @@ func TestASSSignsGroupedAndClamped(t *testing.T) {
 			t.Fatalf("ASS colours must not reach WebVTT: %q", c.text)
 		}
 		for _, m := range rePct.FindAllStringSubmatch(c.settings, -1) {
-			v, _ := strconv.ParseFloat(m[2], 64)
-			lo, hi := 8.0, 92.0
-			if m[1] == "position" {
-				lo, hi = 10, 90
-			}
-			if m[1] == "line" && strings.Contains(c.settings, ",start") {
-				lo = 0
-			}
-			if v < lo || v > hi {
+			if v, _ := strconv.ParseFloat(m[2], 64); v < 0 || v > 100 {
 				t.Fatalf("cue %q placed off screen: %s", c.text, c.settings)
 			}
 		}
 	}
-	// The bottom-right episode title anchored at the frame edge is pulled back on screen.
+	// The \an9 episode title anchored at the frame's right edge hangs from its top-right corner;
+	// its centre is pulled back on screen, so the top edge moves up with it.
 	title := cuesContaining(cues, "Episode 1")
-	if len(title) != 1 || !strings.Contains(title[0].settings, "line:92%") || !strings.HasPrefix(reVTTTag.ReplaceAllString(title[0].text, ""), "『君と運命の出会い。』\nEpisode 1") {
+	if len(title) != 1 || title[0].settings != "line:85.5%,start position:99.5%,line-right align:right" || !strings.HasPrefix(reVTTTag.ReplaceAllString(title[0].text, ""), "『君と運命の出会い。』\nEpisode 1") {
 		t.Fatalf("episode title: %+v", title)
+	}
+	// \an1 / \an3 signs keep their bottom-left / bottom-right corners on their \pos points.
+	if l := cuesContaining(cues, "LEFT SIGN"); l[0].settings != "line:92.6%,end position:3.1%,line-left align:left" {
+		t.Fatalf("left sign: %+v", l)
+	}
+	if r := cuesContaining(cues, "RIGHT SIGN"); r[0].settings != "line:92.6%,end position:96.9%,line-right align:right" {
+		t.Fatalf("right sign: %+v", r)
+	}
+	// Centre-anchored and mixed signs stay centred on their box.
+	if adopt := cuesContaining(cues, "Please Adopt Me"); !strings.HasSuffix(adopt[0].settings, "position:50%,center align:center") {
+		t.Fatalf("centred sign: %+v", adopt)
+	}
+}
+
+// A right-aligned episode title typeset as one \pos event per line (and the second line split
+// into words) is joined into one cue right-aligned on the shared right edge, hanging from its top.
+func TestASSSplitRightAlignedSignKeepsAnchor(t *testing.T) {
+	ass := `[Script Info]
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Title,Arial,54,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,9,40,40,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:20.00,0:00:25.00,Title,,0,0,0,,{\an9\pos(1800,108)}Episode 3
+Dialogue: 0,0:00:20.00,0:00:25.00,Title,,0,0,0,,{\an9\pos(1800,162)}The Day the Moon Fell
+Dialogue: 0,0:00:20.00,0:00:25.00,Title,,0,0,0,,{\an9\pos(1800,216)}Into the Sea
+`
+	cues := parseTestVTT(t, string(ASSToWebVTT([]byte(ass))))
+	if len(cues) != 1 {
+		t.Fatalf("want one joined cue, got %+v", cues)
+	}
+	c := cues[0]
+	if c.text != "Episode 3\nThe Day the Moon Fell\nInto the Sea" {
+		t.Fatalf("text: %q", c.text)
+	}
+	if c.settings != "line:10%,start position:93.8%,line-right align:right" {
+		t.Fatalf("settings: %q", c.settings)
+	}
+
+	// The same sign with mixed anchors falls back to centring on its box.
+	mixed := strings.Replace(ass, `{\an9\pos(1800,216)}`, `{\an7\pos(1500,216)}`, 1)
+	cues = parseTestVTT(t, string(ASSToWebVTT([]byte(mixed))))
+	if len(cues) != 1 || !strings.Contains(cues[0].settings, ",start position:") || !strings.HasSuffix(cues[0].settings, ",center align:center") {
+		t.Fatalf("mixed anchors: %+v", cues)
 	}
 }
 
