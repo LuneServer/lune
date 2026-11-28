@@ -123,6 +123,9 @@ func main() {
 		IsPlaybackActive:    streamSvc.HasActivePlayback,
 		Logger:              logger,
 	})
+	// Generate chapter stills / trickplay for new media as soon as the scan ends instead of
+	// waiting for the next scheduled housekeeping pass.
+	libSvc.SetMediaChangedHook(maintSvc.NotifyMediaAdded)
 	go maintSvc.Run(ctx)
 
 	handler := api.NewHandler(api.Dependencies{

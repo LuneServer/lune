@@ -263,3 +263,50 @@ func TestScanProgressTotal(t *testing.T) {
 		t.Fatalf("forced scan: want total=3 scanned=3 skipped=0, got %+v", st)
 	}
 }
+
+func TestScanCallsMediaChangedHookOnlyForFileChanges(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "lune.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	root := t.TempDir()
+	ep := filepath.Join(root, "[G] Show - 01.mkv")
+	_ = os.WriteFile(ep, []byte("x"), 0o644)
+	svc := NewService(db, ctxCheckingProber{}, nil)
+	var calls int
+	svc.SetMediaChangedHook(func() {
+		if svc.HasRunningScan() {
+			t.Error("hook ran before the scan was marked finished")
+		}
+		calls++
+	})
+	lib, err := svc.CreateLibrary(ctx, "Anime", "anime", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scan := func(force bool) {
+		t.Helper()
+		if _, err := svc.ScanSync(ctx, lib.ID, force); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scan(false)
+	if calls != 1 {
+		t.Fatalf("new file: hook calls = %d, want 1", calls)
+	}
+	scan(false)
+	scan(true) // re-indexes unchanged files: metadata only
+	if calls != 1 {
+		t.Fatalf("unchanged files: hook calls = %d, want 1", calls)
+	}
+	later := time.Now().Add(time.Minute)
+	_ = os.Chtimes(ep, later, later)
+	scan(false)
+	if calls != 2 {
+		t.Fatalf("modified file: hook calls = %d, want 2", calls)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -77,6 +78,8 @@ type Service struct {
 	mu          sync.Mutex
 	scans       map[string]*ScanStatus
 	warnedNoFFP bool
+	// onMediaChanged runs after a scan that indexed new or modified media files.
+	onMediaChanged func()
 }
 
 // NewService creates a library & scanning service.
@@ -125,6 +128,15 @@ func (s *Service) BackfillStaleLibraries(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// SetMediaChangedHook registers fn to run (on the scan goroutine, after the scan has finished)
+// whenever a scan indexes new files or files whose size or mtime changed. Metadata-only
+// re-indexing does not call it.
+func (s *Service) SetMediaChangedHook(fn func()) {
+	s.mu.Lock()
+	s.onMediaChanged = fn
+	s.mu.Unlock()
 }
 
 // SetWatcher binds the background filesystem watcher so library changes refresh watched paths.
@@ -343,11 +355,15 @@ type discoveredFile struct {
 	size           int64
 	mtime          int64
 	isNew          bool
+	fileChanged    bool // new, or size/mtime differ from the indexed fingerprint
 	id             string
 	existingTMDBID string
 }
 
 func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) error {
+	// mediaChanged counts saved items whose file is new or changed on disk (not
+	// metadata-only updates), so per-item maintenance can run for them right away.
+	var mediaChanged atomic.Int64
 	defer func() {
 		s.mu.Lock()
 		if st, ok := s.scans[lib.ID]; ok {
@@ -355,7 +371,11 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 			st.Running = false
 			st.FinishedAt = &now
 		}
+		hook := s.onMediaChanged
 		s.mu.Unlock()
+		if hook != nil && mediaChanged.Load() > 0 {
+			hook()
+		}
 	}()
 
 	existing, err := s.store.ListLibraryFingerprints(ctx, lib.ID)
@@ -402,12 +422,13 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 			}
 			toProcess = append(toProcess, discoveredFile{
 				path: path, size: info.Size(), mtime: mtime, isNew: false, id: fp.ID, existingTMDBID: fp.TMDBID,
+				fileChanged: fp.FileSize != info.Size() || fp.FileMtime != mtime,
 			})
 			return nil
 		}
 
 		toProcess = append(toProcess, discoveredFile{
-			path: path, size: info.Size(), mtime: mtime, isNew: true, id: uuid.NewString(),
+			path: path, size: info.Size(), mtime: mtime, isNew: true, fileChanged: true, id: uuid.NewString(),
 		})
 		return nil
 	})
@@ -428,8 +449,9 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 		batchSize = 100
 	)
 	type scannedItem struct {
-		item  store.MediaItem
-		isNew bool
+		item        store.MediaItem
+		isNew       bool
+		fileChanged bool
 	}
 
 	jobs := make(chan discoveredFile)
@@ -442,6 +464,7 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 		batch := make([]store.MediaItem, 0, batchSize)
 		addedInBatch := 0
 		updatedInBatch := 0
+		changedInBatch := 0
 		flush := func() {
 			if len(batch) == 0 {
 				return
@@ -455,6 +478,7 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 				s.recordItemErr(lib.ID, first, fmt.Errorf("failed to save batch of %d item(s): %w", len(batch), err), len(batch))
 			} else {
 				s.markRequestsAvailableForItems(ctx, batch)
+				mediaChanged.Add(int64(changedInBatch))
 				a, u := addedInBatch, updatedInBatch
 				s.incScan(lib.ID, func(st *ScanStatus) {
 					st.Added += a
@@ -464,6 +488,7 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 			batch = batch[:0]
 			addedInBatch = 0
 			updatedInBatch = 0
+			changedInBatch = 0
 		}
 
 		ticker := time.NewTicker(500 * time.Millisecond)
@@ -477,6 +502,9 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 					return
 				}
 				batch = append(batch, res.item)
+				if res.fileChanged {
+					changedInBatch++
+				}
 				if res.isNew {
 					addedInBatch++
 				} else {
@@ -503,7 +531,7 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 				item, ok := s.buildScannedItem(ctx, lib, job)
 				s.incScan(lib.ID, func(st *ScanStatus) { st.Scanned++ })
 				if ok {
-					results <- scannedItem{item: item, isNew: job.isNew}
+					results <- scannedItem{item: item, isNew: job.isNew, fileChanged: job.fileChanged}
 				}
 			}
 		}()
