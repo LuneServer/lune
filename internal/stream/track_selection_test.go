@@ -6,6 +6,21 @@ import (
 	"github.com/LuneServer/lune/internal/store"
 )
 
+func TestFallbackSkipsSubtitlesInTheAudioLanguage(t *testing.T) {
+	subs := []SubtitleStreamDTO{{Index: 0, Language: "ko"}, {Index: 1, Language: ""}}
+	prefs := store.UserPreferences{SubtitleLanguage: "en"}
+	if sel := selectPreferredSubtitle(subs, "ko", prefs, false); sel == nil || *sel != 1 {
+		t.Fatalf("expected the untagged track, got %v", sel)
+	}
+	if sel := selectPreferredSubtitle(subs[:1], "ko", prefs, false); sel != nil {
+		t.Fatalf("expected no subtitles when only Korean ones exist, got %v", *sel)
+	}
+	prefs.SubtitlesEnabled = true
+	if sel := selectPreferredSubtitle(subs[:1], "ko", prefs, false); sel == nil || *sel != 0 {
+		t.Fatalf("always-on subtitles should still take the Korean track, got %v", sel)
+	}
+}
+
 func TestAnimeAudioSelection(t *testing.T) {
 	audio := []AudioTrackDTO{
 		{Index: 0, Language: "ja", Default: true},
@@ -40,7 +55,9 @@ func TestAnimeAudioSelection(t *testing.T) {
 		{"anime dubbed without a dub keeps full subs", jaOnly, dubbed, true, 0, full},
 		{"movie not affected by subbed", enOnly, subbed, false, 0, signs},
 		{"movie subtitles_enabled still works", enOnly, store.UserPreferences{SubtitleLanguage: "en", SubtitlesEnabled: true, AnimeAudio: "dubbed"}, false, 0, full},
-		{"movie not affected by dubbed", audio, dubbed, false, 0, signs},
+		{"foreign movie turns on full subtitles", audio, dubbed, false, 0, full},
+		{"foreign movie with English audio preference", audio, store.UserPreferences{AudioLanguage: "en", SubtitleLanguage: "en"}, false, 1, signs},
+		{"untagged audio leaves subtitles off", []AudioTrackDTO{{Index: 0, Language: "und", Default: true}}, store.UserPreferences{SubtitleLanguage: "en"}, false, 0, signs},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

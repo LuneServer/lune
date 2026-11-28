@@ -1637,7 +1637,8 @@ func selectPreferredSubtitle(subs []SubtitleStreamDTO, audioLang string, prefs s
 
 	// Determine whether full dialogue subtitles should auto-enable:
 	// 1. User explicitly enabled subtitles in preferences, OR
-	// 2. Anime playback using Japanese (or non-preferred) audio -> auto-enable full subtitles in preferred language!
+	// 2. The audio is in a known language other than the subtitle language (a Korean film, anime
+	//    in Japanese), so the viewer needs full subtitles to follow it.
 	//
 	// For anime with an explicit anime_audio mode, subtitles_enabled is ignored: subbed shows full
 	// subtitles unless the audio is already in the subtitle language, dubbed shows them only when
@@ -1649,8 +1650,11 @@ func selectPreferredSubtitle(subs []SubtitleStreamDTO, audioLang string, prefs s
 	case store.AnimeAudioDubbed:
 		wantFull = audioLang != "" && audioLang != prefSubLang
 	default:
-		wantFull = prefs.SubtitlesEnabled || (isAnime && audioLang != "" && audioLang != prefSubLang)
+		wantFull = prefs.SubtitlesEnabled || (audioLang != "" && audioLang != prefSubLang)
 	}
+	// Subtitles that only transcribe the audio's own language don't help a viewer who doesn't
+	// speak it; skip them in the fallback unless the user asked for subtitles on everything.
+	alwaysOn := prefs.SubtitlesEnabled && animeAudioMode(prefs, isAnime) == ""
 
 	if wantFull {
 		// Prefer non-forced (full dialogue) text track matching preferred subtitle language.
@@ -1661,8 +1665,11 @@ func selectPreferredSubtitle(subs []SubtitleStreamDTO, audioLang string, prefs s
 				return &idx
 			}
 		}
-		// Fallback to any non-forced text track (e.g. "und" sidecar).
+		// Fallback to any other non-forced text track (e.g. "und" sidecar).
 		for _, s := range subs {
+			if !alwaysOn && audioLang != "" && s.Language == audioLang {
+				continue
+			}
 			if !s.RequiresBurnIn && !s.Forced {
 				idx := s.Index
 				return &idx
