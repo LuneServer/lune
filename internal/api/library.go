@@ -296,6 +296,10 @@ func registerLibraryRoutes(r chi.Router, api huma.API, libSvc *library.Service, 
 			st, err = libSvc.ScanSync(ctx, in.ID, in.Force)
 		} else {
 			st, err = libSvc.StartScanAsync(ctx, in.ID, in.Force)
+			if errors.Is(err, library.ErrScanRunning) {
+				// Idempotent: a second request while a scan runs just reports the live status.
+				st, err = libSvc.GetScanStatus(in.ID), nil
+			}
 		}
 		if err != nil {
 			return nil, mapLibraryError(err)

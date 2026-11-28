@@ -217,3 +217,49 @@ func TestIncrementalScanAndStartupBackfillUpgradeStaleMetadata(t *testing.T) {
 		t.Fatalf("expected second scan to skip backfilled movie without re-querying enricher, got scan=%+v calls=%d", st, enricher.movieCalls)
 	}
 }
+
+func TestScanProgressTotal(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "lune.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	root := t.TempDir()
+	for _, n := range []string{"[G] Show - 01.mkv", "[G] Show - 02.mkv", "[G] Show - 03.mkv"} {
+		_ = os.WriteFile(filepath.Join(root, n), []byte("x"), 0o644)
+	}
+	svc := NewService(db, ctxCheckingProber{}, nil)
+	lib, err := svc.CreateLibrary(ctx, "Anime", "anime", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh scan: every file is processed.
+	st, err := svc.ScanSync(ctx, lib.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Total != 3 || st.Scanned != 3 || st.Running {
+		t.Fatalf("first scan: want total=3 scanned=3, got %+v", st)
+	}
+
+	// Incremental rescan: unchanged files are skipped but still count toward progress.
+	st, err = svc.ScanSync(ctx, lib.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Total != 3 || st.Scanned != 3 || st.Skipped != 3 {
+		t.Fatalf("incremental scan: want total=3 scanned=3 skipped=3, got %+v", st)
+	}
+
+	// Forced rescan reprocesses everything and still ends at 100%.
+	st, err = svc.ScanSync(ctx, lib.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Total != 3 || st.Scanned != 3 || st.Skipped != 0 {
+		t.Fatalf("forced scan: want total=3 scanned=3 skipped=0, got %+v", st)
+	}
+}

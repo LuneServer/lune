@@ -32,7 +32,12 @@ var (
 type ScanStatus struct {
 	LibraryID string `json:"library_id"`
 	Running   bool   `json:"running"`
-	Scanned   int    `json:"scanned"`
+	// Scanned counts candidate files fully handled so far (unchanged files skipped, plus
+	// new/modified files once probed or failed). Scanned/Total is the scan progress.
+	Scanned int `json:"scanned"`
+	// Total is the number of candidate media files found for this scan. It is 0 until the
+	// directory walk finishes, so clients should treat 0 on a running scan as indeterminate.
+	Total     int    `json:"total"`
 	Added     int    `json:"added"`
 	Updated   int    `json:"updated"`
 	Removed   int    `json:"removed"`
@@ -388,13 +393,11 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 		}
 
 		seen[path] = true
-		s.incScan(lib.ID, func(st *ScanStatus) { st.Scanned++ })
-
 		mtime := info.ModTime().UnixNano()
 		if fp, ok := existing[path]; ok {
 			needsBackfill := s.enricher != nil && fp.MetadataVersion < CurrentMetadataVersion && isEnrichableLibraryKind(lib.Kind)
 			if !force && fp.FileSize == info.Size() && fp.FileMtime == mtime && !needsBackfill {
-				s.incScan(lib.ID, func(st *ScanStatus) { st.Skipped++ })
+				s.incScan(lib.ID, func(st *ScanStatus) { st.Skipped++; st.Scanned++ })
 				return nil
 			}
 			toProcess = append(toProcess, discoveredFile{
@@ -412,6 +415,11 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 		s.recordScanErr(lib.ID, walkErr)
 		return walkErr
 	}
+
+	// The walk is done: every candidate is now known, so progress (Scanned/Total) is computable.
+	// Unchanged files are already counted in Scanned; changed ones advance it as they finish.
+	total := len(seen)
+	s.incScan(lib.ID, func(st *ScanStatus) { st.Total = total })
 
 	// Probe new or modified files with bounded concurrency and flush DB writes in batches
 	// so large scans (10k–100k files) minimize SQLite write lock hold times and fsyncs.
@@ -492,7 +500,9 @@ func (s *Service) runScan(ctx context.Context, lib store.Library, force bool) er
 				if ctx.Err() != nil {
 					return
 				}
-				if item, ok := s.buildScannedItem(ctx, lib, job); ok {
+				item, ok := s.buildScannedItem(ctx, lib, job)
+				s.incScan(lib.ID, func(st *ScanStatus) { st.Scanned++ })
+				if ok {
 					results <- scannedItem{item: item, isNew: job.isNew}
 				}
 			}
